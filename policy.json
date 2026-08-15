@@ -1,0 +1,103 @@
+{
+  "version": 1,
+  "_comment": "Tiered subagent model selection. Edit this file, not the hook code. See SPEC.md.",
+
+  "tierOrder": ["haiku", "sonnet", "opus", "fable"],
+
+  "_disabledComment1": "Tiers this account cannot use. `fable` requires specific access;",
+  "_disabledComment2": "routing to a model you cannot run fails the spawn outright, so anything",
+  "_disabledComment3": "listed here falls back to the next cheaper tier and the ledger records the",
+  "_disabledComment4": "substitution as `+unavailable:fable->opus`. install.sh pre-populates this by",
+  "_disabledComment5": "checking which models your transcripts show you have actually used.",
+  "disabledTiers": [],
+
+  "agentTypes": {
+    "Explore": "haiku",
+    "statusline-setup": "haiku",
+    "claude-code-guide": "sonnet",
+    "Plan": "opus"
+  },
+
+  "catchAll": {
+    "_comment": "Applied to general-purpose, claude, and any type not in agentTypes.",
+    "base": "sonnet",
+    "cheap": {
+      "maxChars": 300,
+      "patterns": [
+        "\\bfind\\b", "\\blist\\b", "\\blocate\\b", "\\bcount\\b", "\\bgrep\\b",
+        "\\bread\\b", "\\bfetch\\b", "\\bshow me\\b", "\\bwhich file\\b",
+        "\\bwhere is\\b", "\\bwhere are\\b", "\\bhow many\\b", "\\bwhat does .{0,40} return\\b",
+        "\\bsearch for\\b", "\\blook up\\b", "\\bcheck (if|whether)\\b"
+      ]
+    },
+    "expensive": {
+      "_comment1": "minChars promotes on LENGTH ALONE, so it must sit above the length of a",
+      "_comment2": "normal prompt or it fires on everything. Measured over 112 real spawns:",
+      "_comment3": "median 2692 chars, p75 3181, and only 2 fell under an earlier 1500 setting —",
+      "_comment4": "which made 'long' a constant, not a signal. 6000 sits above p75 and still",
+      "_comment5": "catches the genuinely sprawling briefs (longest observed: 8421).",
+      "minChars": 6000,
+      "_comment6": "Verbs removed as too common in routine prompts: audit, security, evaluate,",
+      "_comment7": "why. They fired on ordinary implement/review work and forced it to opus.",
+      "patterns": [
+        "\\bdebug\\b", "\\broot cause\\b", "\\bdesign\\b", "\\barchitect",
+        "\\brefactor\\b", "\\bmigrat(e|ion)\\b", "\\btrade-?offs?\\b",
+        "\\bfailing\\b", "\\bdoesn'?t work\\b", "\\bnot working\\b", "\\bbroken\\b",
+        "\\bimplement\\b", "\\brewrite\\b", "\\bcompare .{0,40} approach",
+        "\\bregression\\b", "\\brace condition\\b"
+      ]
+    }
+  },
+
+  "overrides": {
+    "_comment": "Tags in the Agent description. Authoritative: they bypass both clamps.",
+    "cheapTag": "[cheap]",
+    "cheapTier": "haiku",
+    "hardTag": "[hard]",
+    "hardTier": "fable"
+  },
+
+  "redirect": {
+    "_comment1": "Effort tiering. The Agent tool schema declares additionalProperties:false, so an",
+    "_comment2": "`effort` field cannot be injected per invocation — it would be rejected. Instead,",
+    "_comment3": "mechanical work is redirected to a custom agent definition that carries model AND",
+    "_comment4": "effort together (see agents/scout.md).",
+    "_comment5": "Only GENERIC agent types are redirected. Specialised built-ins such as Explore have",
+    "_comment6": "tuned system prompts worth keeping, so they only get their model set.",
+    "enabled": true,
+    "redirectableTypes": ["general-purpose", "claude", ""],
+    "byTier": {
+      "haiku": "scout",
+      "sonnet": null
+    },
+    "_comment7": "sonnet -> worker is deliberately off by default: sonnet is the base case for a lot",
+    "_comment8": "of varied work, and worker's prompt assumes the approach is already decided. Set it",
+    "_comment9": "to \"worker\" once the ledger shows how those spawns actually behave."
+  },
+
+  "workflow": {
+    "_comment1": "agent() calls inside a Workflow never reach the Agent tool, and an unset",
+    "_comment2": "model inherits the SESSION model. Measured on one developer's machines before",
+    "_comment3": "install: 304 workflow agents had run on the most expensive tier for this reason.",
+    "_comment4": "enforce=true rewrites the script, injecting a shim that scores each prompt",
+    "_comment5": "at runtime and fills in model+effort where the call did not set them.",
+    "_comment6": "Calls that DO set a model are never touched. Set false to fall back to the",
+    "_comment7": "old advisory behaviour (brief + deny wide untiered fan-outs).",
+    "enforce": true,
+    "_comment8": "Effort is settable per agent() on this path — unlike the Agent tool, whose",
+    "_comment9": "schema rejects the field. This is the only place effort can be tiered directly.",
+    "effortByTier": {
+      "haiku": "low",
+      "sonnet": "medium",
+      "opus": "high",
+      "fable": "high"
+    },
+    "_comment10": "Deny is now only the fallback for scripts the rewriter cannot prove safe.",
+    "denyThreshold": 6
+  },
+
+  "limits": {
+    "ledgerMaxBytes": 52428800,
+    "sessionTtlDays": 7
+  }
+}

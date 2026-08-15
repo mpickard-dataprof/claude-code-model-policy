@@ -1,0 +1,15 @@
+# Collected data — machine-specific, and can contain prompt fragments from your
+# own work. Never commit these.
+ledger.jsonl
+ledger.jsonl.*
+diagnostics.jsonl
+sessions/
+
+# Installer backups
+*.bak
+*.model-policy.bak
+*.model-policy-uninstall.bak
+
+# Editor / OS noise
+*.swp
+.DS_Store

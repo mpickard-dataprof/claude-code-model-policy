@@ -1,0 +1,42 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: [18, 20, 22]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Unit suite
+        run: bash test.sh
+      - name: Install into an isolated HOME and verify behaviour
+        shell: bash
+        run: |
+          set -euo pipefail
+          FAKE="$(mktemp -d)"
+          mkdir -p "$FAKE/.claude/projects"
+          echo '{"model":"opus"}' > "$FAKE/.claude/settings.json"
+          cp -r . "$FAKE/mp"
+          cd "$FAKE/mp"
+          env -u CLAUDE_CONFIG_DIR HOME="$FAKE" bash install.sh
+          env -u CLAUDE_CONFIG_DIR HOME="$FAKE" python3 deploy-check.py
+          env -u CLAUDE_CONFIG_DIR HOME="$FAKE" bash uninstall.sh
+          # settings.json must survive uninstall with the user's own keys intact
+          python3 - "$FAKE/.claude/settings.json" <<'PY'
+          import json, sys
+          s = json.load(open(sys.argv[1]))
+          assert s.get("model") == "opus", "uninstall damaged user settings"
+          assert "hooks" not in s, "uninstall left hooks behind"
+          print("uninstall verified clean")
+          PY
