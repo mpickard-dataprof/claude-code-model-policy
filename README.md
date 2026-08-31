@@ -66,6 +66,8 @@ agent really ran on Opus — see [Gotchas](#gotchas).
 - **Never breaks a tool call.** Every hook is fail-open by contract: on any error it exits
   0 with no output and the call proceeds as if the hook were absent. A script rewrite is
   discarded unless it passes a syntax check first.
+- **Never sends anything anywhere.** No hook makes a network call. Everything it records
+  stays in the install root — see [What it records](#what-it-records).
 
 ---
 
@@ -140,6 +142,29 @@ model ACTUALLY run (ground truth):
 
 Workflow enforcement: 6/6 scripts rewritten (23 agent() call sites tiered)
 ```
+
+### What it records
+
+Three paths under the install root, all local and all gitignored:
+
+| Path | Contents |
+|---|---|
+| `ledger.jsonl` | one row per routing decision, one per completed subagent |
+| `diagnostics.jsonl` | spawns that could not be classified, for debugging |
+| `sessions/` | per-session model and effort state |
+
+Two fields in `ledger.jsonl` hold **verbatim text, not hashes**:
+
+- `prompt_fp` — the first 100 characters of the subagent's prompt, lowercased and
+  whitespace-collapsed. It exists so the tuner can join a routing decision to its outcome.
+- `tail` — the last 300 characters of the subagent's final message, used to detect
+  give-up phrasing for `looks_failed`.
+
+So the ledger accumulates real fragments of whatever you were working on. Nothing leaves
+your machine — the hooks make no network calls — but the file is worth treating as work
+content: don't commit it, paste it into an issue, or hand it to anyone for tuning without
+reading it first. This matters most on an employer's machine, where those fragments are
+their material rather than yours. `.gitignore` already excludes all three paths.
 
 ### Tuning it
 
