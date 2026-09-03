@@ -68,6 +68,11 @@ the highest **`stop_seq`** per `agent_id`. Summing them inflates spend: measured
 rows, $490.66 summed against $390.76 deduplicated, a 20% over-count. On rows written before
 `stop_seq` existed, fall back to keeping the row with the highest `usage.turns` per `agent_id`.
 
+Keep the **highest**, never the first. An early row is a mid-flight snapshot, so it not only
+undercounts — it can carry an interim `looks_failed` from an agent that went on to succeed.
+Tuning on those reads a downgrade as backfired when it was not, and recommends an upgrade that
+costs money to fix nothing.
+
 **There are two populations, and only one of them pairs.**
 
 - *Agent-tool spawns* have both a `route` and a `complete` row. Join them on **`prompt_sha`**
