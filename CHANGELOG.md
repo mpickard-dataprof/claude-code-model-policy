@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.2.0 — a ledger you can actually join
+
+Analysing three weeks of real spawns (1,586 rows, two machines) turned up two defects that
+made the ledger's own numbers unreliable. Both are fixed here, and the tuning skill now
+knows about them.
+
+### Fixed
+
+- **`complete` rows double-counted spend.** SubagentStop fires repeatedly for one
+  long-running agent and each firing re-reads the whole transcript, so rows for an
+  `agent_id` supersede each other rather than accumulating. Summing them over-reported
+  spend by 20% ($490.66 against $390.76 true). Rows now carry **`stop_seq`**; keep the
+  highest per `agent_id`.
+- **The join key could pair the wrong two rows.** `prompt_fp` holds only the first 100
+  characters, and a fan-out's agents share a preamble — 122 fingerprints repeated inside a
+  single session, one of them 11 ways. Rows now carry **`prompt_sha`**, a hash over the
+  whole normalised prompt. `prompt_fp` is kept as a graceful fallback and for older rows.
+- **Workflow agents looked like they had escaped the gate.** An `agent()` call that passes
+  its own `agentType` is indistinguishable from an Agent-tool spawn at SubagentStop, so it
+  appeared in the Agent-tool population with no `route` row. Rows now carry **`routed`**,
+  recorded by the gate itself through a per-session append-only sidecar.
+
+### Added
+
+- `prompt_id` on both row types — the host's own spawn identifier, recorded as-is.
+- 13 tests, including the first coverage of `log.mjs`, which previously had none.
+
+### Documentation
+
+- The "Never raises cost" guarantee was stated without its exception. `[cheap]` and
+  `[hard]` are explicit overrides and deliberately bypass every clamp — including the agent
+  definition's declared model, so `[hard]` on a `worker` runs above the sonnet it declares.
+  Both the guarantee and the tag table now say so.
+- New "What it records" section covering every ledger field and which ones hold prompt text.
+
 ## 0.1.0 — first public release
 
 Initial release. Extracted from a working setup across three machines and generalized.

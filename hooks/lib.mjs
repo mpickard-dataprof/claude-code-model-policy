@@ -8,6 +8,7 @@ import {
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 export const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -506,9 +507,44 @@ export function resolveWorkflowScript(toolInput) {
   return null; // built-in workflow, or a path we cannot read
 }
 
-export function promptFingerprint(text) {
+/** Shared normalisation, so the gate and SubagentStop derive keys from the same text. */
+function normalizePrompt(text) {
   if (typeof text !== 'string' || !text) return null;
-  return text.replace(/\s+/g, ' ').trim().toLowerCase().slice(0, 100) || null;
+  return text.replace(/\s+/g, ' ').trim().toLowerCase() || null;
+}
+
+export function promptFingerprint(text) {
+  const n = normalizePrompt(text);
+  return n ? n.slice(0, 100) : null;
+}
+
+/**
+ * Collision-resistant join key for one spawn.
+ *
+ * `promptFingerprint` keeps only the first 100 characters, which is not enough to
+ * tell apart the agents of a fan-out: they share a preamble and differ only later,
+ * in the task number or file path. Measured over 1,586 real ledger rows, 122
+ * fingerprints repeated inside a single session and one was reused 11 ways, so
+ * joining a routing decision to its outcome on the fingerprint alone can pair the
+ * wrong two rows.
+ *
+ * Hashing the WHOLE prompt separates those. It also stores no prompt text, unlike
+ * the fingerprint it supplements — see "What it records" in the README.
+ *
+ * The fingerprint is deliberately kept alongside it. This hash is exact, so it
+ * only joins when both hooks see byte-identical prompts; the gate reads the tool
+ * input while SubagentStop recovers the prompt from the subagent's transcript, and
+ * if those ever diverge the fingerprint still pairs them approximately. Consumers
+ * should try `prompt_sha` first and fall back.
+ */
+export function promptHash(text) {
+  const n = normalizePrompt(text);
+  if (!n) return null;
+  try {
+    return createHash('sha256').update(n).digest('hex').slice(0, 16);
+  } catch {
+    return null; // hashing is a nicety; never fail a hook over it
+  }
 }
 
 export const AGENTS_DIR = join(ROOT, 'agents');
@@ -618,6 +654,56 @@ export function writeSessionTier(sessionId, model, extra = {}) {
     writeFileSync(tmp, JSON.stringify({ model: model ?? null, at: new Date().toISOString(), ...extra }));
     renameSync(tmp, join(SESSIONS_DIR, `${sessionId}.json`));
   } catch { /* non-fatal */ }
+}
+
+/**
+ * Per-session sidecar recording what the gate saw and which agents have stopped.
+ *
+ * Append-only on purpose. A whole fan-out of subagents writes concurrently, and a
+ * read-modify-write on one shared JSON file loses updates under exactly that load
+ * — which would silently mislabel gated spawns as ungated. Small appends survive
+ * concurrent writers, so every line is kept.
+ *
+ * Lines are `g <prompt-fingerprint>` (a spawn the Agent gate routed) and
+ * `s <agent_id>` (one SubagentStop). gcSessions() reaps these with everything
+ * else in SESSIONS_DIR, so they inherit the same TTL.
+ */
+const SIDECAR_MAX_BYTES = 1048576;
+
+function sidecarPath(sessionId) {
+  return join(SESSIONS_DIR, `${sessionId}.events`);
+}
+
+/** Normalise to a single line — the file is line-delimited and values are untrusted. */
+function sidecarLine(kind, value) {
+  return `${kind} ${String(value).replace(/[\r\n]+/g, ' ')}`;
+}
+
+export function recordSessionEvent(sessionId, kind, value) {
+  if (!sessionId || !value) return;
+  try {
+    mkdirSync(SESSIONS_DIR, { recursive: true });
+    const p = sidecarPath(sessionId);
+    // A runaway session must not grow this without bound. Past the cap we stop
+    // appending: `routed` then degrades to false, which reads as "unknown", not
+    // as a wrong tier.
+    try { if (statSync(p).size > SIDECAR_MAX_BYTES) return; } catch { /* not created yet */ }
+    appendFileSync(p, `${sidecarLine(kind, value)}\n`);
+  } catch { /* never fatal */ }
+}
+
+export function countSessionEvents(sessionId, kind, value) {
+  if (!sessionId || !value) return 0;
+  const needle = sidecarLine(kind, value);
+  try {
+    let n = 0;
+    for (const line of readFileSync(sidecarPath(sessionId), 'utf8').split('\n')) {
+      if (line === needle) n += 1;
+    }
+    return n;
+  } catch {
+    return 0; // no sidecar -> nothing was recorded for this session
+  }
 }
 
 export function gcSessions(ttlDays) {

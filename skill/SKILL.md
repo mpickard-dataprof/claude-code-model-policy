@@ -52,7 +52,8 @@ computed answer comes back.
   - `event: "route"` — an Agent-tool routing decision (`agent_type`, `rule`, `set`, `requested`,
     `session_tier`, `prompt_chars`, `redirect_to`)
   - `event: "complete"` — an outcome (`agent_type`, `usage`, `looks_failed`, `tail`,
-    **`actual_model`** — the model read back from the agent's own transcript)
+    `routed`, `stop_seq`, **`actual_model`** — the model read back from the agent's own
+    transcript)
   - `event: "workflow"` — a Workflow call (`form`, `enforced`, `sites`, `nested`, `reason`,
     `agent_calls`, `model_opts`, `denied`)
 
@@ -60,21 +61,39 @@ computed answer comes back.
 while the agent ran on opus. Wherever both exist, report any disagreement between them
 prominently — that is a broken enforcement path, and it outranks every tuning question below.
 
+**Deduplicate `complete` rows before counting anything.** SubagentStop fires repeatedly for one
+long-running agent, and each firing re-reads the whole transcript — so rows for one `agent_id`
+are cumulative snapshots that **supersede** each other, not increments. Keep only the row with
+the highest **`stop_seq`** per `agent_id`. Summing them inflates spend: measured over 1,146 real
+rows, $490.66 summed against $390.76 deduplicated, a 20% over-count. On rows written before
+`stop_seq` existed, fall back to keeping the row with the highest `usage.turns` per `agent_id`.
+
 **There are two populations, and only one of them pairs.**
 
-- *Agent-tool spawns* have both a `route` and a `complete` row. Join them on **`prompt_fp`**
-  (a normalised prompt fingerprint written by both hooks), scoped to `session_id`. Do **not**
-  pair by arrival order: agents run in parallel during fan-out, so order-based pairing silently
-  mismatches rows.
+- *Agent-tool spawns* have both a `route` and a `complete` row. Join them on **`prompt_sha`**
+  (a hash of the whole normalised prompt, written by both hooks), scoped to `session_id`.
+  Fall back to **`prompt_fp`** only for rows predating `prompt_sha`, and say how many needed
+  the fallback — `prompt_fp` keeps just the first 100 characters, so a fan-out's agents share
+  one value and pairing on it can match a routing decision to a *different* agent's outcome.
+  Do **not** pair by arrival order either: agents run in parallel, so order-based pairing
+  silently mismatches rows.
+- A `complete` row with **`routed: false`** never passed the Agent gate — it is a Workflow
+  `agent()` call that borrowed a custom `agentType`. Do not report these as spawns that
+  escaped the gate; they are hand-tiered by the shim and belong in the workflow population.
+  Only `routed: true` rows with no matching `route` row are a genuine enforcement concern.
 - *Workflow subagents* (`agent_type: "workflow-subagent"`) never pass through the Agent gate, so
   they have a `complete` row and **no `route` row, by design**. They are typically the majority of
   all spend. Do **not** drop them as unpaired — analyse them as their own population, keyed on
   `actual_model` and `usage`. Their tier was chosen by the injected shim, so `actual_model` is the
   only record of what the policy decided.
 
-Report the size of each population separately. Only genuinely unmatched Agent-tool rows count as
-a drop worth worrying about; a high drop rate *there* means fingerprints are not lining up and
-every downstream number is suspect.
+Report the size of each population separately, and report **what share of pairs joined on
+`prompt_sha` versus the `prompt_fp` fallback**. The two hooks derive the hash from different
+sources — the gate from the tool input, SubagentStop from the subagent's own transcript — so a
+low `prompt_sha` match rate on recent rows means those texts have diverged and the exact key is
+not working; say so rather than quietly leaning on the fingerprint. Only genuinely unmatched
+Agent-tool rows count as a drop worth worrying about; a high drop rate *there* means keys are
+not lining up and every downstream number is suspect.
 - `event: "error"` rows mean the policy produced a tier outside `tierOrder` — a config typo. Report
   these first; routing was skipped entirely for those spawns.
 - If a ledger from another machine is available, accept multiple paths and pool them.

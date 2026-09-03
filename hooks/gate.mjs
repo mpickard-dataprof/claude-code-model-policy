@@ -11,7 +11,7 @@ import {
   readStdin, parseJson, loadPolicy, resolveTier, sessionRecordFor, normalizeModel,
   sessionTierFromTranscript, writeSessionTier, tierIndex, promptFingerprint,
   stripCodeNoise, injectWorkflowTiers, resolveWorkflowScript, sessionTierFor,
-  ledger, emit,
+  ledger, emit, recordSessionEvent, promptHash,
 } from './lib.mjs';
 
 // How long a cached session model is trusted before the transcript is re-read.
@@ -119,6 +119,8 @@ async function main() {
       description: String(toolInput.description ?? '').slice(0, 120),
       prompt_chars: toolInput.prompt.length,
       prompt_fp: promptFingerprint(toolInput.prompt),
+      prompt_sha: promptHash(toolInput.prompt),
+      prompt_id: input.prompt_id ?? null,
       requested,
       session_tier: sessionTier,
       set: tier,
@@ -126,6 +128,12 @@ async function main() {
       rule: redirectTo ? `${rule}+redirect:${redirectTo}` : rule,
       changed,
     }, policy.limits?.ledgerMaxBytes);
+
+    // Record that this exact prompt passed the gate, so SubagentStop can tell an
+    // Agent-tool spawn from a Workflow agent() call that borrowed a custom
+    // agentType and never reached this hook at all. Must happen before the
+    // early return below, or every already-correct spawn looks ungated.
+    recordSessionEvent(input.session_id, 'g', promptFingerprint(toolInput.prompt));
 
     if (!changed) return; // already correct, nothing to rewrite
 

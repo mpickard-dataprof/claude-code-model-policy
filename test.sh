@@ -333,6 +333,80 @@ check "fresh record -> cached tier is trusted"        opus \
   "$(printf '{"session_id":"%s","transcript_path":"%s","tool_use_id":"t","hook_event_name":"PreToolUse","tool_name":"Agent","tool_input":{"subagent_type":"Plan","description":"p","prompt":"plan the migration"}}' "$S_STALE" "$STALE_TS")"
 rm -f "$STALE_TS" "$SESS/$S_STALE.json"
 
+echo
+echo "== Join key: fan-out collisions and SubagentStop provenance =="
+
+LOG="$DIR/hooks/log.mjs"
+
+# Read one field off the last ledger row of a given event type.
+ledger_field() { # <event> <field>
+  grep "\"event\":\"$1\"" "$LEDG" 2>/dev/null | tail -1 \
+    | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const v=JSON.parse(s)[process.argv[1]];console.log(v===undefined?"MISSING":String(v))}catch{console.log("MISSING")}})' "$2"
+}
+
+# These two differ only past character 100 — exactly the shape of a fan-out, where
+# every agent shares a preamble and differs in the task number. The fingerprint
+# cannot separate them; the hash must, or the tuner pairs the wrong route row with
+# the wrong outcome.
+FAN_A='you are the task reviewer for one task of a plan. working dir is the repo root and the branch is ready. task 7 alpha'
+FAN_B='you are the task reviewer for one task of a plan. working dir is the repo root and the branch is ready. task 9 beta'
+S_JOIN="test-session-join"
+printf '{"model":"opus","via":"sessionstart","agents":["scout","worker"]}' > "$SESS/$S_JOIN.json"
+
+rm -f "$LEDG"
+printf '%s' "$(agent "$S_JOIN" "\"subagent_type\":\"general-purpose\",\"description\":\"d\",\"prompt\":\"$FAN_A\"")" | sh "$RUN" "$GATE" >/dev/null 2>&1
+FP_A="$(ledger_field route prompt_fp)"; SHA_A="$(ledger_field route prompt_sha)"
+printf '%s' "$(agent "$S_JOIN" "\"subagent_type\":\"general-purpose\",\"description\":\"d\",\"prompt\":\"$FAN_B\"")" | sh "$RUN" "$GATE" >/dev/null 2>&1
+FP_B="$(ledger_field route prompt_fp)"; SHA_B="$(ledger_field route prompt_sha)"
+
+assert "route row carries a prompt hash"           "16"   "$(printf '%s' "$SHA_A" | wc -c | tr -d ' ')"
+assert "fan-out siblings share a fingerprint"      "same" "$([ "$FP_A" = "$FP_B" ] && echo same || echo differ)"
+assert "...but the hash separates them"            "differ" "$([ "$SHA_A" = "$SHA_B" ] && echo same || echo differ)"
+# The sidecar is keyed on the FINGERPRINT, not the hash, so a fan-out writes one
+# identical line per sibling. That is deliberate: `routed` only ever asks "did the
+# gate see a spawn with this prompt", and a shared line answers that for all of
+# them. Pairing an individual spawn is the hash's job, not the sidecar's.
+assert "gate records every spawn in the sidecar"   "2" \
+  "$(grep -c "^g $FP_B\$" "$SESS/$S_JOIN.events" 2>/dev/null || echo 0)"
+
+# SubagentStop side. A transcript the log hook can actually read: one user turn
+# carrying the prompt, one assistant turn carrying model and usage.
+AGENT_TS="$SANDBOX/agent-transcript.jsonl"
+{ printf '{"type":"user","message":{"content":"%s"}}\n' "$FAN_B"
+  printf '{"type":"assistant","message":{"model":"claude-sonnet-5","usage":{"input_tokens":10,"output_tokens":20}}}\n'; } > "$AGENT_TS"
+stop() { # <agent_id>
+  printf '{"session_id":"%s","hook_event_name":"SubagentStop","agent_id":"%s","agent_type":"general-purpose","prompt_id":"p1","agent_transcript_path":"%s","last_assistant_message":"done"}' \
+    "$S_JOIN" "$1" "$AGENT_TS"
+}
+
+printf '%s' "$(stop ag1)" | sh "$RUN" "$LOG" >/dev/null 2>&1
+assert "complete row joins the route row by hash"  "$SHA_B" "$(ledger_field complete prompt_sha)"
+assert "gated spawn is marked routed"              "true"   "$(ledger_field complete routed)"
+assert "first stop is seq 1"                       "1"      "$(ledger_field complete stop_seq)"
+assert "native prompt_id is carried through"       "p1"     "$(ledger_field complete prompt_id)"
+
+# The same agent stopping again supersedes rather than adds: usage is re-read
+# cumulatively, so a consumer must be able to keep only the highest seq.
+printf '%s' "$(stop ag1)" | sh "$RUN" "$LOG" >/dev/null 2>&1
+assert "repeat stop for one agent increments seq"  "2"      "$(ledger_field complete stop_seq)"
+printf '%s' "$(stop ag2)" | sh "$RUN" "$LOG" >/dev/null 2>&1
+assert "a different agent starts its own seq"      "1"      "$(ledger_field complete stop_seq)"
+
+# An agent the gate never saw (a Workflow agent() that borrowed an agentType)
+# must not be reported as having escaped the gate.
+UNGATED_TS="$SANDBOX/ungated-transcript.jsonl"
+{ printf '{"type":"user","message":{"content":"a prompt that never passed the gate"}}\n'
+  printf '{"type":"assistant","message":{"model":"claude-haiku-4-5-20251001","usage":{"input_tokens":1,"output_tokens":2}}}\n'; } > "$UNGATED_TS"
+printf '{"session_id":"%s","hook_event_name":"SubagentStop","agent_id":"ag3","agent_type":"general-purpose","agent_transcript_path":"%s","last_assistant_message":"done"}' \
+  "$S_JOIN" "$UNGATED_TS" | sh "$RUN" "$LOG" >/dev/null 2>&1
+assert "ungated spawn is marked not routed"        "false"  "$(ledger_field complete routed)"
+
+# Fail-open: the log hook must stay silent on rubbish.
+assert "log hook: malformed stdin -> no output"    ""       "$(printf 'not json' | sh "$RUN" "$LOG" 2>&1)"
+assert "log hook: empty stdin -> no output"        ""       "$(printf '' | sh "$RUN" "$LOG" 2>&1)"
+
+rm -f "$AGENT_TS" "$UNGATED_TS" "$SESS/$S_JOIN.json" "$SESS/$S_JOIN.events"
+
 rm -f "$SESS/$SESSION_OK.json" "$SESS/$SESSION_READY.json" "$SESS/$SESSION_LEGACY.json"
 echo
 echo "-----------------------------------------"

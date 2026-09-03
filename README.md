@@ -58,9 +58,13 @@ agent really ran on Opus — see [Gotchas](#gotchas).
 
 ## What it never does
 
-- **Never raises cost.** Every rule is a clamp. A tier is capped by the model you
-  explicitly requested, by the agent definition's own declared model, and by your session
-  model — whichever is cheapest wins.
+- **Never raises cost, unless you ask it to.** Every *scored* rule is a clamp: a tier is
+  capped by the model you explicitly requested, by the agent definition's own declared
+  model, and by your session model — whichever is cheapest wins. The two tags are the
+  deliberate exception. `[cheap]` and `[hard]` are explicit overrides and bypass the
+  clamps in both directions, so `[hard]` on an agent whose definition declares a cheap
+  model *will* run it on the top tier. That is the point of the tag; it is called out
+  here because it is the one case where this raises a bill rather than lowering it.
 - **Never overrides an explicit choice.** `agent(prompt, { model: 'opus' })` is left
   exactly as written.
 - **Never breaks a tool call.** Every hook is fail-open by contract: on any error it exits
@@ -119,8 +123,10 @@ never deletes a file you wrote — a hand-written `scout.md` survives untouched.
 Put a tag in the Agent task description to force a tier:
 
 ```
-[cheap]   -> haiku   (bypasses the clamps; a deliberate cost decision)
-[hard]    -> the top tier
+[cheap]   -> haiku          (bypasses the clamps; a deliberate cost decision)
+[hard]    -> the top tier    (bypasses them too — including the agent
+                              definition's declared model, so [hard] on a
+                              worker runs above the sonnet it declares)
 ```
 
 ### Seeing what it did
@@ -151,14 +157,27 @@ Three paths under the install root, all local and all gitignored:
 |---|---|
 | `ledger.jsonl` | one row per routing decision, one per completed subagent |
 | `diagnostics.jsonl` | spawns that could not be classified, for debugging |
-| `sessions/` | per-session model and effort state |
+| `sessions/` | per-session model and effort state, plus a `.events` sidecar per session |
 
 Two fields in `ledger.jsonl` hold **verbatim text, not hashes**:
 
 - `prompt_fp` — the first 100 characters of the subagent's prompt, lowercased and
-  whitespace-collapsed. It exists so the tuner can join a routing decision to its outcome.
+  whitespace-collapsed. A coarse join key, kept because it degrades gracefully.
 - `tail` — the last 300 characters of the subagent's final message, used to detect
   give-up phrasing for `looks_failed`.
+
+Four fields carry **no prompt text** and exist to make the ledger analysable:
+
+- `prompt_sha` — 16 hex characters of a SHA-256 over the whole normalised prompt. This is
+  the join key: `prompt_fp` keeps only a preamble, and a fan-out's agents share theirs, so
+  pairing on the fingerprint alone can match a routing decision to another agent's outcome.
+- `stop_seq` — SubagentStop fires repeatedly for one long-running agent and each row
+  re-reads the whole transcript, so rows **supersede** rather than accumulate. Keep the
+  highest `stop_seq` per `agent_id`; summing them double-counts.
+- `routed` — whether the Agent gate actually saw this spawn. A Workflow `agent()` call can
+  borrow a custom `agentType` and look like an Agent-tool spawn that escaped the gate; this
+  distinguishes the two.
+- `prompt_id` — the host's own identifier for the spawn, recorded as-is.
 
 So the ledger accumulates real fragments of whatever you were working on. Nothing leaves
 your machine — the hooks make no network calls — but the file is worth treating as work

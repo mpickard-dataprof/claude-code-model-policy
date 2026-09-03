@@ -8,7 +8,10 @@
 
 import { readFileSync, appendFileSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { join } from 'node:path';
-import { readStdin, parseJson, loadPolicy, ledger, promptFingerprint, ROOT } from './lib.mjs';
+import {
+  readStdin, parseJson, loadPolicy, ledger, promptFingerprint, promptHash, ROOT,
+  recordSessionEvent, countSessionEvents,
+} from './lib.mjs';
 
 // SubagentStop also fires for Claude Code's internal utility agents (session
 // title generation and similar). Those carry no agent_type and no transcript,
@@ -148,12 +151,37 @@ async function main() {
     return;
   }
 
+  const fp = promptFingerprint(prompt);
+
+  // Provenance. SubagentStop reports whatever agent type ran, so a Workflow
+  // agent() call that passed opts.agentType (e.g. 'general-purpose') is
+  // indistinguishable here from a real Agent-tool spawn. Those rows then appear
+  // in the Agent-tool population with no `route` row and read as agents that
+  // escaped the gate — every such alarm inspected so far has been a correctly
+  // tiered workflow agent. Ask the gate directly instead: it records the
+  // fingerprint of every spawn it routes.
+  const routed = countSessionEvents(input.session_id, 'g', fp) > 0;
+
+  // SubagentStop fires REPEATEDLY for one long-running agent, and readTranscript
+  // above re-reads the whole transcript each time — so every row is a cumulative
+  // snapshot that supersedes the previous one, not an increment. Summing rows
+  // double-counts: over 1,146 real rows, $490.66 summed against $390.76 true.
+  // Number them so a consumer can keep the highest `stop_seq` per agent_id
+  // without having to infer supersession from a usage field.
+  const agentId = input.agent_id ?? null;
+  recordSessionEvent(input.session_id, 's', agentId);
+  const stopSeq = agentId ? countSessionEvents(input.session_id, 's', agentId) : null;
+
   ledger({
     event: 'complete',
     session_id: input.session_id,
-    agent_id: input.agent_id ?? null,
+    agent_id: agentId,
     agent_type: agentType || null,
-    prompt_fp: promptFingerprint(prompt),
+    routed,
+    stop_seq: stopSeq,
+    prompt_fp: fp,
+    prompt_sha: promptHash(prompt),
+    prompt_id: input.prompt_id ?? null,
     actual_model: ranked[0] ?? null,
     actual_models_all: ranked.length > 1 ? ranked : undefined,
     usage,

@@ -39,10 +39,31 @@ try {
     .filter(r => Date.parse(r.ts) >= since);
 } catch { console.log("no ledger yet — the hooks have not logged anything"); process.exit(0); }
 
-const routes = rows.filter(r => r.event === "route");
-const done   = rows.filter(r => r.event === "complete");
-const wf     = rows.filter(r => r.event === "workflow");
-const errs   = rows.filter(r => r.event === "error");
+/**
+ * SubagentStop fires more than once for a long-running agent, and each firing re-reads
+ * the whole transcript — so the rows for one agent_id are cumulative snapshots that
+ * supersede each other. Counting them all inflated every total here by 20% against a
+ * real ledger. Keep the highest stop_seq per agent (turns, on rows written before
+ * stop_seq existed).
+ */
+const seqOf = (r) => r.stop_seq ?? r.usage?.turns ?? 0;
+const dedupe = (list) => {
+  const best = new Map();
+  const anonymous = [];
+  for (const r of list) {
+    if (!r.agent_id) { anonymous.push(r); continue; }
+    const cur = best.get(r.agent_id);
+    if (!cur || seqOf(r) >= seqOf(cur)) best.set(r.agent_id, r);
+  }
+  return [...best.values(), ...anonymous];
+};
+
+const routes    = rows.filter(r => r.event === "route");
+const doneRaw   = rows.filter(r => r.event === "complete");
+const done      = dedupe(doneRaw);
+const superseded = doneRaw.length - done.length;
+const wf        = rows.filter(r => r.event === "workflow");
+const errs      = rows.filter(r => r.event === "error");
 
 const pad = (s, n) => String(s).padEnd(n);
 const tbl = (title, pairs) => {
@@ -57,6 +78,7 @@ const count = (arr, f) => Object.entries(arr.reduce((a, r) => {
 
 console.log(`last ${days}d: ${routes.length} Agent spawns routed, ${done.length} completed, ` +
             `${wf.length} workflows checked (${wf.filter(w => w.denied).length} denied)` +
+            (superseded ? `, ${superseded} superseded rows folded` : "") +
             (errs.length ? `, ${errs.length} POLICY ERRORS` : ""));
 
 if (!routes.length && !done.length) {
