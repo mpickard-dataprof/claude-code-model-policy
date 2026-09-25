@@ -12,7 +12,11 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 export const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
-export const POLICY_PATH = join(ROOT, 'policy.json');
+// Overridable like LEDGER_PATH and SESSIONS_DIR. Without this the suite had to
+// overwrite the real policy.json to test a corrupt config and move it back
+// afterwards — an interrupted run would leave `{ broken` as the live policy and
+// silently disable all routing.
+export const POLICY_PATH = process.env.MODEL_POLICY_POLICY || join(ROOT, 'policy.json');
 
 // The test suite must never touch the real ledger: it is the only record of how
 // past spawns were routed and what they cost, and the tuning skill reads nothing
@@ -231,6 +235,122 @@ export function resolveTier(toolInput, policy, sessionTier) {
 }
 
 /**
+ * Decide whether this spawn should be offloaded to an OpenAI model via Codex.
+ *
+ * Why this exists: the Agent tool's `model` enum is Anthropic-only, so a
+ * subagent cannot simply BE a GPT model. The only route to another provider is
+ * to swap the agent type for a relay definition that shells out to the `codex`
+ * CLI and reports back what it said. On an account whose Codex auth_mode is
+ * `chatgpt`, that subprocess bills against a flat-rate subscription instead of
+ * the Anthropic usage window — which is the entire point.
+ *
+ * Runs AFTER resolveTier, and reuses its answer: the tier the task scored to
+ * picks which OpenAI model it deserves. Scoring work is not duplicated, it is
+ * re-read on the other provider's ladder.
+ *
+ * Returns null (stay on Anthropic) unless every one of these holds:
+ *   - the codex block is enabled and names a relay agent;
+ *   - that agent was on disk when this session loaded its definitions — agent
+ *     definitions do NOT hot-reload, so redirecting to one this session never
+ *     saw fails the spawn outright with "Agent type not found";
+ *   - the requested type is generic (swapping a specialised built-in would throw
+ *     away the tuned system prompt that made it worth calling);
+ *   - and either the [gpt] tag is present, or the scored tier is opted in.
+ */
+/**
+ * Separates the relay's routing instructions from the task itself.
+ *
+ * Fixed string, exported, and used by both the preamble builder and the
+ * fingerprint stripper so the two can never drift apart.
+ */
+export const CODEX_TASK_MARKER = '--- CODEX-TASK-BEGINS (send only what follows) ---';
+
+export function resolveCodexOffload(toolInput, policy, tier, currentType, record) {
+  const cx = policy.codex || {};
+  // Strictly boolean true, matching the gate and the wrapper. A string "false"
+  // is truthy in JS, so a loose check here would advertise and route offloads
+  // that the execution-side guards then refuse — turning a config typo into
+  // work dispatched straight into a guaranteed failure.
+  if (cx.enabled !== true) return null;
+
+  const agent = typeof cx.agent === 'string' && cx.agent.length > 0 ? cx.agent : null;
+  if (!agent) return null;
+
+  // Same SessionStart guard the redirect path uses. A session recovered from its
+  // transcript predates the install and must never be redirected.
+  const loaded = record?.via === 'sessionstart' && Array.isArray(record.agents);
+  if (!loaded || !record.agents.includes(agent)) return null;
+
+  // Naming the relay directly is a legitimate way to ask for an offload — it is
+  // how a person opts in explicitly. Treat it as one so the spawn still gets
+  // validated routing metadata, rather than reaching the wrapper bare and
+  // falling back to a default model nobody chose.
+  const direct = String(currentType ?? '') === agent;
+
+  const types = Array.isArray(cx.offloadableTypes) ? cx.offloadableTypes : [];
+  if (!direct && !types.includes(String(currentType ?? ''))) return null;
+
+  const desc = String(toolInput?.description ?? '');
+  const tagged = typeof cx.tagFrom === 'string'
+    ? desc.includes(cx.tagFrom)
+    : desc.includes(policy.overrides?.codexTag || '[gpt]');
+
+  const never = Array.isArray(cx.neverAutoTiers) ? cx.neverAutoTiers : [];
+  const auto = Array.isArray(cx.autoTiers) ? cx.autoTiers : [];
+  const autoOn = auto.includes(tier) && !never.includes(tier);
+
+  if (!direct && !tagged && !autoOn) return null;
+
+  const spec = (cx.byTier || {})[tier];
+  if (!spec || typeof spec.model !== 'string') return null;
+
+  const model = spec.model;
+  const effort = typeof spec.effort === 'string' ? spec.effort : 'medium';
+
+  // The relay only writes a file, runs a subprocess and reads the result back,
+  // so it runs at the bottom of the ladder no matter how hard the real task is.
+  const relayTier = availableTier(cx.relayTier || 'haiku', policy).tier;
+
+  // Travels in the prompt because the Agent schema is additionalProperties:false
+  // and there is no field to carry it in.
+  //
+  // The BEGIN marker matters: these lines address the relay, not the worker.
+  // Forwarding them would tell the OpenAI model to itself hand the task to
+  // Codex — contradictory instructions at best, a recursive spawn at worst. The
+  // marker is what lets the relay send the task body and nothing else, and it is
+  // a fixed string so the split is mechanical rather than a judgement call.
+  // Absolute path to THIS installation's wrapper. The agent definition used to
+  // hardcode ~/.claude-shared/model-policy, so an install from any other
+  // checkout either failed with "not found" or silently ran a different
+  // installation against a different policy.
+  const wrapper = join(ROOT, 'bin', 'codex-relay.sh');
+
+  const preamble = [
+    'CODEX-OFFLOAD:',
+    `  model: ${model}`,
+    `  effort: ${effort}`,
+    `  wrapper: ${wrapper}`,
+    '',
+    'These lines are for you, the relay. Run the wrapper with exactly those settings',
+    'and relay its answer verbatim. Do not attempt the task yourself, and do NOT',
+    'include any line up to and including the marker below in what you send —',
+    'forwarding it would instruct the worker to be another relay.',
+    '',
+    CODEX_TASK_MARKER,
+    '',
+  ].join('\n');
+
+  return {
+    agent,
+    model,
+    effort,
+    relayTier,
+    preamble,
+    via: direct ? 'direct' : (tagged ? 'tag' : `auto:${tier}`),
+  };
+}
+
+/**
  * Stable key for joining a `route` entry to its `complete` entry.
  *
  * The two events share no id: PreToolUse has `tool_use_id`, SubagentStop has
@@ -317,7 +437,11 @@ export function stripCodeNoise(src) {
  * string even when the call site passes a template literal or a variable —
  * something no amount of static analysis of the script could recover.
  *
- * Explicit `model`/`effort` on a call are always left alone: a script that has
+ * An explicit `model` on a call is never overridden, and an explicit `effort` is
+ * never changed. An ABSENT effort is filled from effortByTier even when the model
+ * was chosen by the author — without that, effortByTier.fable was unreachable,
+ * since the scorer never returns fable and the only route to it is an explicit
+ * model. Left alone otherwise: a script that has
  * already made the cost decision outranks the policy.
  *
  * Returns { script, sites, reason }. `script` is null whenever the rewrite is not
@@ -424,13 +548,33 @@ function __mpPick(prompt) {
   }
   return tier;
 }
+/* Same alias handling as normalizeModel(): a call may name a full model id. */
+function __mpTier(m) {
+  const s = String(m == null ? '' : m).toLowerCase();
+  if (s.indexOf('haiku') !== -1) return 'haiku';
+  if (s.indexOf('sonnet') !== -1) return 'sonnet';
+  if (s.indexOf('opus') !== -1) return 'opus';
+  if (s.indexOf('fable') !== -1 || s.indexOf('mythos') !== -1) return 'fable';
+  return null;
+}
 /* Captured BEFORE any global is patched, so __mpAgent can never recurse into itself. */
 const __mpReal = agent;
 function __mpAgent(prompt, opts) {
   const o = Object.assign({}, opts || {});
-  if (!o.model) {
-    o.model = __mpPick(prompt);
-    if (!o.effort) o.effort = __mpCfg.effort[o.model];
+  if (!o.model) o.model = __mpPick(prompt);
+  /* Effort is filled whenever it is ABSENT, including on a call that chose its
+     own model. The scorer only ever returns haiku/sonnet/opus, so the previous
+     "only when we picked the model" rule made effortByTier.fable unreachable:
+     the one way to get a fable workflow agent is to ask for it explicitly, which
+     was exactly the case that skipped this block. A model the author chose is
+     still never overridden - only the effort they left unset is filled in. */
+  if (!o.effort) {
+    /* Normalise a full model id ("claude-opus-5") to its tier before the lookup,
+       and only assign a value that exists - assigning undefined adds a key whose
+       presence differs from absence to whatever reads it downstream. */
+    const __t = __mpTier(o.model);
+    const __e = __t ? __mpCfg.effort[__t] : undefined;
+    if (__e) o.effort = __e;
   }
   return __mpReal(prompt, o);
 }
@@ -514,8 +658,56 @@ function normalizePrompt(text) {
 }
 
 export function promptFingerprint(text) {
-  const n = normalizePrompt(text);
+  const n = normalizePrompt(stripOffloadPreamble(text));
   return n ? n.slice(0, 100) : null;
+}
+
+/**
+ * Drop a CODEX-OFFLOAD preamble so a fingerprint describes the TASK.
+ *
+ * The preamble runs well past 100 characters, and a fingerprint keeps only the
+ * first 100 — so without this, every offloaded spawn sharing a model and effort
+ * fingerprints identically no matter what it was asked to do. That is not a
+ * cosmetic loss: `countSessionEvents` uses the fingerprint to decide whether a
+ * completing agent passed through the gate, so one gated offload would make
+ * every later ungated one report `routed: true`.
+ *
+ * Applied inside promptFingerprint so both hooks strip identically without
+ * either having to remember to. Deliberately NOT applied to promptHash: the hash
+ * is the exact-join key and must reflect the literal prompt the agent received.
+ */
+export function stripOffloadPreamble(text) {
+  if (typeof text !== 'string') return text;
+  // Matched on the FULL generated shape, not on a length window and not on the
+  // header word alone.
+  //
+  // Two earlier versions were wrong in opposite directions. A 600-character
+  // cutoff broke as soon as the preamble grew a `wrapper:` line: on an install
+  // with a long path the marker moved past the window and every offload went
+  // back to fingerprinting its own routing metadata. Matching the bare prefix
+  // `CODEX-OFFLOAD:` then stripped a legitimate task that merely began by
+  // quoting the protocol — a documentation example about this very feature.
+  //
+  // So require the whole envelope this code emits: the header, then its three
+  // indented fields, then the marker. Task text that happens to mention the
+  // protocol does not reproduce that structure.
+  // `.+` for the wrapper path, not `\S+`: an install under a directory with a
+  // space ("/Users/Matt Smith/...") failed to match, and the envelope then went
+  // UNSTRIPPED — putting routing metadata back into every fingerprint, the exact
+  // bug the anchor was added to fix.
+  const ENVELOPE = /^CODEX-OFFLOAD:\n {2}model: \S+\n {2}effort: \S+\n {2}wrapper: .+\n/;
+  if (!ENVELOPE.test(text)) return text;
+  // The marker must be a LINE of its own, not merely present somewhere: an
+  // `indexOf` hit inside a sentence was enough to trigger a split.
+  const m = text.match(new RegExp('^' + CODEX_TASK_MARKER.replace(/[.*+?^${}()|[\]\\-]/g, '\\$&') + '$', 'm'));
+  if (!m || m.index === undefined) return text;
+  return text.slice(m.index + CODEX_TASK_MARKER.length);
+
+  // Honest limit: this recognises the SHAPE the gate emits, so a caller who
+  // reproduces those exact bytes is indistinguishable from a real envelope.
+  // Closing that needs provenance (a nonce the gate records and this verifies),
+  // which is not worth it while the only consequence is a fingerprint — the
+  // exact-hash join does not depend on this function at all.
 }
 
 /**
@@ -551,11 +743,48 @@ export const AGENTS_DIR = join(ROOT, 'agents');
 
 /** Agent definition names present on disk right now. */
 export function availableAgents() {
-  try {
-    return readdirSync(AGENTS_DIR).filter((f) => f.endsWith('.md')).map((f) => f.slice(0, -3));
-  } catch {
-    return [];
+  // Enumerate the INSTALLED definitions, not this package's source directory.
+  //
+  // The two are not the same set, and the difference decides whether a redirect
+  // works or kills the spawn. Updating the package adds a file to agents/ but
+  // installs no symlink, so reading the source dir reports an agent Claude Code
+  // has never heard of — and the gate then rewrites subagent_type to a type that
+  // does not exist, failing the spawn outright. Reading the config dirs means a
+  // missing symlink degrades to "no redirect", which is merely suboptimal.
+  // When set, the env var REPLACES the defaults rather than adding to them —
+  // otherwise the real config dirs leak into every test that tries to pin this
+  // down, and a non-standard install cannot be pointed somewhere else.
+  const override = (process.env.MODEL_POLICY_AGENT_DIRS || '').split(':').filter(Boolean);
+  const dirs = override.length ? override : [
+    join(homedir(), '.claude', 'agents'),
+    join(homedir(), '.claude-work', 'agents'),
+    join(homedir(), '.claude-personal', 'agents'),
+  ];
+
+  const found = new Set();
+  let readAny = false;
+  for (const d of dirs) {
+    try {
+      const entries = readdirSync(d);
+      readAny = true; // the directory EXISTS; an empty one is a real answer
+      for (const f of entries) {
+        if (f.endsWith('.md')) found.add(f.slice(0, -3));
+      }
+    } catch { /* directory absent: nothing installed there */ }
   }
+  // Fall back to the package's own agents/ only when no config directory could
+  // be read AT ALL. Keying this off `found.size` instead meant an empty but
+  // perfectly readable config dir reported every agent in the package — exactly
+  // the "claims an agent the session never loaded" bug this function exists to
+  // prevent, reintroduced by its own fallback.
+  if (!readAny) {
+    try {
+      for (const f of readdirSync(AGENTS_DIR)) {
+        if (f.endsWith('.md')) found.add(f.slice(0, -3));
+      }
+    } catch { /* nothing readable anywhere */ }
+  }
+  return [...found];
 }
 
 /**

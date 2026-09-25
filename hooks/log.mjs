@@ -115,8 +115,14 @@ function readTranscript(path) {
       const c = rec.message?.content;
       if (typeof c === 'string') out.prompt = c;
       else if (Array.isArray(c)) {
-        const t = c.find((b) => b && b.type === 'text' && typeof b.text === 'string');
-        if (t) out.prompt = t.text;
+        // Join every text block, not just the first. The gate hashes one
+        // contiguous prompt string; if the host splits that same text across
+        // blocks, taking only block 0 hashes a prefix and the exact join
+        // silently fails, dropping the pair to the lossy fingerprint fallback.
+        const t = c
+          .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
+          .map((b) => b.text);
+        if (t.length) out.prompt = t.join('');
       }
     }
   }

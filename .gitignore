@@ -13,3 +13,10 @@ sessions/
 # Editor / OS noise
 *.swp
 .DS_Store
+
+# Python bytecode (bin/codex-supervise.py)
+__pycache__/
+*.pyc
+
+# Mountain Duck sync metadata
+.duckversions/

@@ -22,6 +22,15 @@
     "_comment": "Applied to general-purpose, claude, and any type not in agentTypes.",
     "base": "sonnet",
     "cheap": {
+      "_comment1": "UNCHANGED 2026-09-16 after an attempt to extend it was reverted in full.",
+      "_comment2": "`verify`, `grade`, `confirm whether` and `you are a grader` were all tried",
+      "_comment3": "and removed: maxChars 300 is not the guard it looks like. 'Verify the crypto",
+      "_comment4": "protocol in protocol.md is sound.' is 58 characters and needs real judgement,",
+      "_comment5": "and 'You are a grader. Assess whether the protocol is sound.' scores",
+      "_comment6": "mechanical on the role phrase alone. Both would be redirected to scout,",
+      "_comment7": "whose prompt tells it to STOP when judgement is required — so the cost of a",
+      "_comment8": "false cheap match is a refused task, not a slightly worse answer.",
+      "_comment9": "Cheap matching is for bounded factual retrieval. A verb is not a rubric.",
       "maxChars": 300,
       "patterns": [
         "\\bfind\\b", "\\blist\\b", "\\blocate\\b", "\\bcount\\b", "\\bgrep\\b",
@@ -54,7 +63,11 @@
     "cheapTag": "[cheap]",
     "cheapTier": "haiku",
     "hardTag": "[hard]",
-    "hardTier": "fable"
+    "hardTier": "opus",
+    "_comment2": "Offload tag. Sends the spawn to an OpenAI model via the Codex CLI instead",
+    "_comment3": "of an Anthropic one. Authoritative like the other tags, and it wins over",
+    "_comment4": "them: [gpt] [hard] means a hard task run on Codex's top model.",
+    "codexTag": "[gpt]"
   },
 
   "redirect": {
@@ -68,11 +81,57 @@
     "redirectableTypes": ["general-purpose", "claude", ""],
     "byTier": {
       "haiku": "scout",
-      "sonnet": null
+      "sonnet": null,
+      "fable": "architect"
     },
+    "_comment10": "fable -> architect added 2026-09-16. Measured: 31 paired tag:hard spawns",
+    "_comment11": "burned $690.82 (47% of all spend) at 41k median output over 47 median turns.",
+    "_comment12": "looks_failed was 0%, but that only means no refusal phrase matched — it is",
+    "_comment13": "NOT evidence the extra turns were wasted. Treat medium as an experiment and",
+    "_comment14": "judge it on rework and escaped defects, not on the same weak proxy.",
+    "_comment15": "architect.md keeps model fable but declares effort medium, which is the only",
+    "_comment16": "way to lower effort on the Agent path. Forks are unaffected: they inherit the",
+    "_comment17": "parent model and never reach this gate.",
     "_comment7": "sonnet -> worker is deliberately off by default: sonnet is the base case for a lot",
     "_comment8": "of varied work, and worker's prompt assumes the approach is already decided. Set it",
     "_comment9": "to \"worker\" once the ledger shows how those spawns actually behave."
+  },
+
+  "codex": {
+    "_comment1": "Offload to OpenAI models through the Codex CLI. Verified 2026-09-16:",
+    "_comment2": "`codex` auth_mode is `chatgpt`, i.e. a flat-rate subscription rather than",
+    "_comment3": "per-token API billing — so an offloaded spawn costs nothing against the",
+    "_comment4": "Anthropic usage window beyond the haiku relay agent that drives it.",
+    "_comment5": "Mechanism: the gate rewrites subagent_type to the `codex` agent, sets model",
+    "_comment6": "haiku, and prepends a CODEX-OFFLOAD preamble naming the OpenAI model and",
+    "_comment7": "effort. That agent shells out and relays the answer verbatim.",
+    "enabled": true,
+    "_comment8": "The relay agent. Must exist in agents/ and be symlinked into the config dir.",
+    "agent": "codex",
+    "_comment9": "Only generic types offload: a specialised built-in's system prompt would be",
+    "_comment10": "discarded by the swap, which is the whole value of using it.",
+    "offloadableTypes": ["general-purpose", "claude", ""],
+    "_comment11": "Tier -> OpenAI model and reasoning effort. Slugs verified against",
+    "_comment12": "~/.codex/models_cache.json on 2026-09-16.",
+    "byTier": {
+      "haiku":  { "model": "gpt-5.6-sol",   "effort": "low" },
+      "sonnet": { "model": "gpt-5.6-terra", "effort": "medium" },
+      "opus":   { "model": "gpt-5.6-terra", "effort": "high" },
+      "fable":  { "model": "gpt-6-astra",   "effort": "medium" }
+    },
+    "_comment13": "Tiers that offload AUTOMATICALLY, with no [gpt] tag. Empty means the tag is",
+    "_comment14": "the only route in — the mechanism is live but nothing moves to OpenAI until",
+    "_comment15": "you opt a tier in. [\"opus\"] reaches 18 agent-tool spawns, $105.22 in the",
+    "_comment16": "measured window. NOT the 126 workflow opus spawns ($228.49): the workflow",
+    "_comment17": "shim rewrites model and effort but never calls resolveCodexOffload, so no",
+    "_comment18": "agent() call inside a script can offload today. Implementing that is the",
+    "_comment19": "obvious next step and would roughly triple the reachable saving.",
+    "autoTiers": [],
+    "_comment20": "haiku is deliberately excluded from autoTiers even if listed: scout spawns",
+    "_comment21": "cost $6.77 across 13 completes, and a subprocess round-trip is slower than",
+    "_comment22": "just running them. Offloading them would trade money you are not spending",
+    "_comment23": "for latency you would feel.",
+    "neverAutoTiers": ["haiku"]
   },
 
   "workflow": {
@@ -81,8 +140,9 @@
     "_comment3": "install: 304 workflow agents had run on the most expensive tier for this reason.",
     "_comment4": "enforce=true rewrites the script, injecting a shim that scores each prompt",
     "_comment5": "at runtime and fills in model+effort where the call did not set them.",
-    "_comment6": "Calls that DO set a model are never touched. Set false to fall back to the",
-    "_comment7": "old advisory behaviour (brief + deny wide untiered fan-outs).",
+    "_comment6": "A call's own MODEL is never overridden; an effort it left unset is filled in",
+    "_comment6b": "from effortByTier, which is the only route to a fable workflow agent.",
+    "_comment7": "Set false to fall back to the old advisory behaviour (brief + deny).",
     "enforce": true,
     "_comment8": "Effort is settable per agent() on this path — unlike the Agent tool, whose",
     "_comment9": "schema rejects the field. This is the only place effort can be tiered directly.",
@@ -90,8 +150,10 @@
       "haiku": "low",
       "sonnet": "medium",
       "opus": "high",
-      "fable": "high"
+      "fable": "medium"
     },
+    "_comment11": "fable dropped high -> medium 2026-09-16: same over-thinking signature as the",
+    "_comment12": "tag:hard population. Raise it back if workflow fable agents start failing.",
     "_comment10": "Deny is now only the fallback for scripts the rewriter cannot prove safe.",
     "denyThreshold": 6
   },

@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.3.0 — offload to ChatGPT models, and `[hard]` means opus
+
+### Added
+
+- **`[gpt]` offload to OpenAI models via the Codex CLI.** A `[gpt]`-tagged spawn is
+  redirected to the new `codex` agent (haiku, effort low), which hands the task to
+  `bin/codex-relay.sh` and relays the answer verbatim — the reasoning runs on a
+  ChatGPT subscription instead of Anthropic token billing. The tier is still scored
+  and picks the OpenAI model through `codex.byTier` (`gpt-5.6-sol` / `gpt-5.6-terra` /
+  `gpt-6-astra`). `codex.autoTiers` can offload whole tiers without a tag; it ships
+  empty, and `neverAutoTiers` keeps haiku work on Anthropic.
+- **`architect` agent** (fable, effort medium) for spawns that resolve to fable.
+- **Workflow effort fill for explicit models.** `agent(p, { model: 'fable' })` now gets
+  `workflow.effortByTier`'s effort when the call sets none; an explicit effort is kept.
+
+### Changed
+
+- **`overrides.hardTier` defaults to `opus` (was `fable`).** Measured over 102 `[hard]`
+  spawns: 49% of all subagent spend, 0% `looks_failed`, and the same work routed to
+  opus by the expensive-verb rule failed 2% of the time. Priced at opus the same
+  tokens cost 48% less. Set it back to `fable` for the top tier. `[gpt] [hard]` now
+  picks the opus-tier OpenAI model accordingly.
+- The session brief reads the tag tiers from `policy.json` instead of hardcoding them.
+
+### Fixed
+
+- **A test failed only on macOS.** `/bin/bash` 3.2 mangles regex backslashes in a
+  single-quoted string nested inside `$(...)`, so the effort-fill probe extracted
+  nothing. The probe now runs from a quoted heredoc file; 140/140 under bash 3.2 and 5.
+
 ## 0.2.0 — a ledger you can actually join
 
 Analysing three weeks of real spawns (1,586 rows, two machines) turned up two defects that
