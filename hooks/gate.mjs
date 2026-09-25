@@ -11,7 +11,7 @@ import {
   readStdin, parseJson, loadPolicy, resolveTier, sessionRecordFor, normalizeModel,
   sessionTierFromTranscript, writeSessionTier, tierIndex, promptFingerprint,
   stripCodeNoise, injectWorkflowTiers, resolveWorkflowScript, sessionTierFor,
-  ledger, emit, recordSessionEvent, promptHash,
+  ledger, emit, recordSessionEvent, promptHash, resolveCodexOffload,
 } from './lib.mjs';
 
 // How long a cached session model is trusted before the transcript is re-read.
@@ -101,12 +101,107 @@ async function main() {
       && r.redirectableTypes.includes(currentType)
       ? (r.byTier || {})[tier] : null;
     const loaded = record?.via === 'sessionstart' && Array.isArray(record.agents);
-    const redirectTo = typeof candidate === 'string' && candidate.length > 0
+    let redirectTo = typeof candidate === 'string' && candidate.length > 0
       && loaded && record.agents.includes(candidate)
       ? candidate : null;
 
+    // Codex offload. Decided AFTER the tier, because the tier is what picks which
+    // OpenAI model the task deserves — the scoring work is not wasted, it is
+    // reused on the other provider's ladder.
+    //
+    // Same SessionStart guard as the redirect above: the relay agent must have
+    // been on disk when this session loaded its definitions, or the spawn dies
+    // with "Agent type not found".
+    const cx = policy.codex || {};
+    const isRelayType = typeof cx.agent === 'string' && cx.agent.length > 0
+      && currentType === cx.agent;
+
+    // Naming the relay agent directly is a route into the subprocess that does
+    // not pass the offload decision at all — so with offloading disabled, a
+    // direct `subagent_type: "codex"` spawn would still run Codex, just without
+    // any routing metadata. Refuse it here, and have the wrapper refuse it too:
+    // a kill switch that only covers one of two entrances is not a kill switch.
+    if (isRelayType && cx.enabled !== true) {
+      ledger({
+        event: 'route',
+        tool: 'Agent',
+        session_id: input.session_id,
+        tool_use_id: input.tool_use_id,
+        agent_type: currentType,
+        description: String(toolInput.description ?? '').slice(0, 120),
+        rule: 'deny:codex-disabled',
+        denied: true,
+      }, policy.limits?.ledgerMaxBytes);
+      emit({
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason:
+            'model-policy: Codex offload is disabled (codex.enabled is not true), so the '
+            + `\`${cx.agent}\` relay agent cannot be spawned. Use a normal agent type.`,
+        },
+      });
+      return;
+    }
+
+    // Score a DIRECT relay call as if the type had not been named.
+    //
+    // resolveTier clamps to the agent definition's own declared model, and the
+    // relay declares haiku because the relay is only a courier. Feeding that
+    // clamped tier into the offload lookup picked the OpenAI model from the
+    // courier's cost rather than the task's difficulty: a hard task submitted as
+    // `subagent_type: "codex"` resolved to gpt-5.6-sol at effort low, while the
+    // identical prompt via `[gpt]` on general-purpose resolved to gpt-5.6-terra
+    // at high. Same work, quietly weaker worker, and a clean exit hiding it.
+    let offloadTier = tier;
+    let offloadRule = rule;
+    if (isRelayType) {
+      const scored = resolveTier({ ...toolInput, subagent_type: '' }, policy, sessionTier);
+      if (tierIndex(scored.tier, policy.tierOrder) !== null) {
+        offloadTier = scored.tier;
+        // Carry the rule too. Reporting the DISCARDED score's rule made the
+        // ledger and the permission message cite `clamp:declared` — the relay's
+        // own haiku ceiling — for a decision that no longer used it.
+        offloadRule = scored.rule;
+      }
+    }
+
+    const offload = resolveCodexOffload(toolInput, policy, offloadTier, currentType, record);
+    let effectiveTier = tier;
+    if (offload) {
+      // The relay agent itself only shells out and reads a file back, so it runs
+      // at the cheapest tier available regardless of how hard the task is. The
+      // real reasoning happens in the subprocess.
+      effectiveTier = offload.relayTier;
+      redirectTo = offload.agent;
+    }
+
+    // The prompt the subagent will actually receive. It matters for pairing, not
+    // just for dispatch: SubagentStop hashes the prompt out of the subagent's own
+    // transcript, so if the gate logged the pre-offload text the two sha values
+    // would never line up and every offloaded spawn would fall back to the lossy
+    // prompt_fp join. Log what the agent sees; keep the original alongside it.
+    const finalPrompt = offload ? offload.preamble + toolInput.prompt : toolInput.prompt;
+
+    // Re-validate AFTER every routing decision, not just after resolveTier.
+    // The tierIndex check above guards `tier`, but the offload branch then
+    // replaces it with `relayTier` — so a typo in codex.relayTier used to sail
+    // straight into `model` and fail the spawn outright. Validate what is
+    // actually emitted, which is the only value that can break anything.
+    if (tierIndex(effectiveTier, policy.tierOrder) === null) {
+      ledger({
+        event: 'error',
+        reason: 'routing produced a tier that is not in tierOrder',
+        tier: effectiveTier, scored_tier: tier, rule,
+        offload: offload ? 'codex' : null,
+        session_id: input.session_id,
+      }, policy.limits?.ledgerMaxBytes);
+      return; // leave the spawn alone rather than emit a model that cannot run
+    }
+
     const requested = typeof toolInput.model === 'string' ? toolInput.model : null;
-    const changed = requested !== tier || redirectTo !== null;
+    const changed = requested !== effectiveTier || redirectTo !== null
+      || finalPrompt !== toolInput.prompt;
 
     // Log every spawn, including ones already on the right model — the tuner
     // needs the full denominator, not just the rewrites.
@@ -118,14 +213,27 @@ async function main() {
       agent_type: toolInput.subagent_type ?? null,
       description: String(toolInput.description ?? '').slice(0, 120),
       prompt_chars: toolInput.prompt.length,
-      prompt_fp: promptFingerprint(toolInput.prompt),
-      prompt_sha: promptHash(toolInput.prompt),
+      prompt_fp: promptFingerprint(finalPrompt),
+      prompt_sha: promptHash(finalPrompt),
+      // Diagnostic only — nothing joins on it. It exists so the tuner can tell
+      // that an offloaded spawn and a later native retry were the same task.
+      prompt_sha_pre: offload ? promptHash(toolInput.prompt) : null,
       prompt_id: input.prompt_id ?? null,
       requested,
       session_tier: sessionTier,
-      set: tier,
+      set: effectiveTier,
+      // The tier the task actually scored to. On an offload this differs from
+      // `set` (the relay's own cheap tier), and it is the one the tuner needs:
+      // it says what the work was worth, not what the courier cost.
+      scored_tier: offload ? offloadTier : tier,
       redirect_to: redirectTo,
-      rule: redirectTo ? `${rule}+redirect:${redirectTo}` : rule,
+      offload: offload ? 'codex' : null,
+      offload_model: offload?.model ?? null,
+      offload_effort: offload?.effort ?? null,
+      offload_via: offload?.via ?? null,
+      rule: offload
+        ? `${offloadRule}+offload:codex/${offload.model}`
+        : (redirectTo ? `${rule}+redirect:${redirectTo}` : rule),
       changed,
     }, policy.limits?.ledgerMaxBytes);
 
@@ -133,7 +241,7 @@ async function main() {
     // Agent-tool spawn from a Workflow agent() call that borrowed a custom
     // agentType and never reached this hook at all. Must happen before the
     // early return below, or every already-correct spawn looks ungated.
-    recordSessionEvent(input.session_id, 'g', promptFingerprint(toolInput.prompt));
+    recordSessionEvent(input.session_id, 'g', promptFingerprint(finalPrompt));
 
     if (!changed) return; // already correct, nothing to rewrite
 
@@ -145,16 +253,23 @@ async function main() {
     // while the agent actually ran on claude-opus-5. This does not turn the hook
     // into a blanket approver: per the hooks reference, deny and ask permission
     // rules are still evaluated regardless of what a hook returns.
-    const updatedInput = { ...toolInput, model: tier };
+    const updatedInput = { ...toolInput, model: effectiveTier };
     if (redirectTo) updatedInput.subagent_type = redirectTo;
+    // The relay agent reads which OpenAI model to run from this preamble. It has
+    // to travel in the prompt: the Agent schema is additionalProperties:false, so
+    // there is no field to put it in — the same constraint that forces effort to
+    // live in agent definitions.
+    if (offload) updatedInput.prompt = finalPrompt;
 
     emit({
       hookSpecificOutput: {
         hookEventName: 'PreToolUse',
         permissionDecision: 'allow',
-        permissionDecisionReason: redirectTo
-          ? `model-policy: ${tier} via ${redirectTo} (${rule})`
-          : `model-policy: ${tier} (${rule})`,
+        permissionDecisionReason: offload
+          ? `model-policy: offload to codex ${offload.model} (effort ${offload.effort}, scored ${offloadTier}, ${offloadRule})`
+          : (redirectTo
+            ? `model-policy: ${effectiveTier} via ${redirectTo} (${rule})`
+            : `model-policy: ${effectiveTier} (${rule})`),
         updatedInput,
       },
     });
@@ -257,7 +372,7 @@ async function main() {
           permissionDecisionReason:
             `model-policy: tiered ${injected.sites} agent() call site(s)` +
             (indirect ? ` from ${indirect.form}` : '') +
-            `; calls that set their own model were left as written.` +
+            `; a call's own model was kept, and an effort it omitted was filled from policy.` +
             // The child of a nested workflow() is out of reach — measured, its
             // agents inherit the session model. Say so, because the child script
             // is usually written in the same turn and can still be tiered by hand.

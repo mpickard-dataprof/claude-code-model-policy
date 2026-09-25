@@ -12,6 +12,50 @@ import {
   availableAgents, emit,
 } from './lib.mjs';
 
+/**
+ * The offload section of the brief.
+ *
+ * Only shown when the mechanism is actually live, and only describing the route
+ * that is actually open. Briefing Claude on a `[gpt]` tag that the gate would
+ * ignore — because the relay agent is missing, or codex.enabled is false — would
+ * teach it to write tags that silently do nothing.
+ */
+function codexBrief(policy) {
+  const cx = policy.codex || {};
+  if (cx.enabled !== true || !cx.agent) return [];
+  if (!availableAgents().includes(cx.agent)) return [];
+
+  const tag = policy.overrides?.codexTag || '[gpt]';
+  const auto = (Array.isArray(cx.autoTiers) ? cx.autoTiers : [])
+    .filter((t) => !(cx.neverAutoTiers || []).includes(t));
+
+  return [
+    '## Offloading to OpenAI models (saves the Anthropic usage window)',
+    '',
+    `Tag a task description with \`${tag}\` and the spawn is handed to an OpenAI model`,
+    'through the Codex CLI instead of an Anthropic one. The work still comes back to you',
+    'as a normal subagent result — a cheap relay agent drives the subprocess and reports',
+    'what it said.',
+    '',
+    'This runs on a ChatGPT subscription, not Anthropic token billing, so an offloaded',
+    'task costs essentially nothing against this window. **Prefer it whenever the work is',
+    'self-contained** — a review, an analysis, a bounded implementation, a second opinion —',
+    'and especially when the window is under pressure.',
+    '',
+    'Keep work on Anthropic when it needs this session\'s conversation context, a tool only',
+    'this harness has, or tight back-and-forth with you. The relay passes the prompt and',
+    'nothing else.',
+    '',
+    `The tier still gets scored: it picks which OpenAI model the task deserves. \`${tag}\``,
+    'combines with the other tags, so `[gpt] [hard]` means a hard task on the Codex model for the hard tier.',
+    '',
+    auto.length
+      ? `Tiers that offload automatically with no tag: ${auto.join(', ')}.`
+      : 'Nothing offloads automatically — the tag is the only route in.',
+    '',
+  ];
+}
+
 async function main() {
   const input = parseJson(await readStdin());
   if (!input) return;
@@ -42,7 +86,7 @@ async function main() {
     lines,
     `  general-purpose / claude -> scored from the prompt (base ${policy.catchAll?.base ?? 'sonnet'})`,
     '',
-    'Tag a task description with `[cheap]` to force haiku, or `[hard]` to force the top tier.',
+    `Tag a task description with \`${policy.overrides?.cheapTag ?? '[cheap]'}\` to force ${policy.overrides?.cheapTier ?? 'haiku'}, or \`${policy.overrides?.hardTag ?? '[hard]'}\` to force ${policy.overrides?.hardTier ?? 'the top tier'}.`,
     '',
     '## Two agent types carry effort as well as model',
     '',
@@ -53,9 +97,13 @@ async function main() {
     '  worker - sonnet + effort medium. Routine work whose approach is already decided:',
     '           write a specified test, implement a given signature, apply a known migration.',
     '',
+    '  architect - fable + effort medium. Genuinely hard work: unknown root cause,',
+    '           multi-file design, a contested call. Used when a spawn resolves to fable.',
+    '',
     'Prefer `scout` over `general-purpose` for anything mechanical — it is the cheapest',
     'path available, and generic spawns that score mechanical are redirected to it anyway.',
     '',
+    ...codexBrief(policy),
     '## Workflow scripts ARE auto-tiered — but say so when you know better',
     '',
     'An inline Workflow script is rewritten before it runs: every `agent()` call that',
@@ -67,7 +115,8 @@ async function main() {
     '  opus   - real reasoning: debugging, design, multi-file change',
     '  fable  - only when explicitly asked for; it is the most expensive tier',
     '',
-    'Any call that sets its own model is left exactly as written, so set one wherever',
+    'A call that sets its own model keeps it (an effort you leave unset is filled in),',
+    'so set a model wherever',
     'the prompt text would mislead the scorer — a short prompt pointing at a hard',
     'problem, or a long one that is only boilerplate:',
     '',

@@ -63,10 +63,12 @@ agent really ran on Opus — see [Gotchas](#gotchas).
   model, and by your session model — whichever is cheapest wins. The two tags are the
   deliberate exception. `[cheap]` and `[hard]` are explicit overrides and bypass the
   clamps in both directions, so `[hard]` on an agent whose definition declares a cheap
-  model *will* run it on the top tier. That is the point of the tag; it is called out
+  model *will* run it on the hard tier (opus by default; set `overrides.hardTier` to `fable` for the top tier). That is the point of the tag; it is called out
   here because it is the one case where this raises a bill rather than lowering it.
-- **Never overrides an explicit choice.** `agent(prompt, { model: 'opus' })` is left
-  exactly as written.
+- **Never overrides an explicit choice.** `agent(prompt, { model: 'opus' })` keeps that
+  model. An `effort` the call did NOT set is filled in from `workflow.effortByTier` —
+  that is the only route to a fable workflow agent, since the scorer never picks fable
+  and the only way to get one is to ask for it. An effort you do set is never changed.
 - **Never breaks a tool call.** Every hook is fail-open by contract: on any error it exits
   0 with no output and the call proceeds as if the hook were absent. A script rewrite is
   discarded unless it passes a syntax check first.
@@ -124,7 +126,7 @@ Put a tag in the Agent task description to force a tier:
 
 ```
 [cheap]   -> haiku          (bypasses the clamps; a deliberate cost decision)
-[hard]    -> the top tier    (bypasses them too — including the agent
+[hard]    -> opus            (overrides.hardTier; bypasses them too — including the agent
                               definition's declared model, so [hard] on a
                               worker runs above the sonnet it declares)
 ```
@@ -285,7 +287,9 @@ hooks/
   gate.mjs    PreToolUse    — set the model on Agent spawns; rewrite Workflow scripts
   log.mjs     SubagentStop  — record real token usage, outcome, and actual model
   lib.mjs     tier resolution, clamps, script rewriting, ledger
-agents/       scout.md, worker.md — model + effort together
+agents/       scout.md, worker.md, architect.md — model + effort together
+              codex.md — relays a task to an OpenAI model via bin/codex-relay.sh
+bin/          codex-relay.sh — the supervised `codex exec` wrapper
 skill/        the /model-policy-tune analysis skill
 ```
 
