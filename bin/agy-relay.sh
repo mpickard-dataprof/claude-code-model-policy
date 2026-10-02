@@ -156,10 +156,18 @@ if [ "$ACCESS" = edit ]; then ARGS+=(--ro-bind "$CWD/.git" /workspace/.git); fi
 # An edit worker may change source files, but never leave host-executed editor,
 # agent, CI, or shell configuration behind. Directories are private tmpfses;
 # files are rebound readonly (or /dev/null when absent) so they cannot be made.
+# bwrap must create a mount point for each absent mask on the host side of the rw
+# bind; remember those (and any parent dirs) so the empty placeholders are removed.
+MASK_CREATED=()
 if [ "$ACCESS" = edit ]; then
   while IFS=$'\t' read -r kind name; do
     case "$name" in ''|/*|*'..'*) continue ;; esac
     target="/workspace/$name"; source="$CWD/$name"
+    if [ ! -e "$source" ] && [ ! -L "$source" ]; then
+      rel="$name"; parents=()
+      while [ "$(dirname "$rel")" != . ]; do rel="$(dirname "$rel")"; [ -e "$CWD/$rel" ] || parents=("$CWD/$rel" "${parents[@]}"); done
+      MASK_CREATED+=("${parents[@]}" "$source")
+    fi
     if [ "$kind" = D ]; then
       ARGS+=(--tmpfs "$target")
     elif [ "$kind" = F ]; then
@@ -262,6 +270,11 @@ try:
 except Exception: pass
 PY
 )"
+# Deepest first: drop placeholders only while they are still empty and untouched.
+for (( i=${#MASK_CREATED[@]}-1; i>=0; i-- )); do
+  p="${MASK_CREATED[$i]}"
+  if [ -f "$p" ] && [ ! -L "$p" ] && [ ! -s "$p" ]; then rm -f -- "$p"; elif [ -d "$p" ] && [ ! -L "$p" ]; then rmdir -- "$p" 2>/dev/null || true; fi
+done
 NESTED_GIT=""
 [ "$ACCESS" = edit ] && NESTED_GIT="$(find "$CWD" -mindepth 2 -name .git -print -quit 2>/dev/null || true)"
 python3 - "$SUP" "$POOL" "$MODEL" "$ACCESS" "$CWD" "$OUT" "$ERR" "$FORCED_REASON" "$NESTED_GIT" <<'PY'
