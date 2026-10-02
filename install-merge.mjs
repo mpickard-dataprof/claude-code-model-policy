@@ -19,7 +19,7 @@ const RUNNER = join(hooksDir, 'run.sh');
 // Each entry: [event, matcher | null, script]
 const WANTED = [
   ['SessionStart', null, join(hooksDir, 'brief.mjs')],
-  ['PreToolUse', 'Agent|Workflow', join(hooksDir, 'gate.mjs')],
+  ['PreToolUse', 'Agent|Workflow|Bash|Write|Edit|NotebookEdit', join(hooksDir, 'gate.mjs')],
   ['SubagentStop', null, join(hooksDir, 'log.mjs')],
 ];
 

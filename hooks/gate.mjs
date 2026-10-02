@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// PreToolUse hook, matcher: Agent|Workflow
+// PreToolUse hook, matcher: Agent|Workflow|Bash|Write|Edit|NotebookEdit
 //
 // Agent    -> rewrites tool_input.model to the policy tier.
 // Workflow -> denies only a wide fan-out that sets no models at all.
@@ -12,8 +12,9 @@ import {
   sessionTierFromTranscript, writeSessionTier, tierIndex, promptFingerprint,
   stripCodeNoise, injectWorkflowTiers, resolveWorkflowScript, sessionTierFor,
   ledger, emit, recordSessionEvent, promptHash, resolveCodexOffload, resolveAgyOffload,
-  offloadTag,
+  offloadTag, issueAgyGrant, agyRelayPreamble, ROOT,
 } from './lib.mjs';
+import { join } from 'node:path';
 
 // How long a cached session model is trusted before the transcript is re-read.
 // Bounds how stale the clamp can get after a mid-session /model change.
@@ -35,6 +36,26 @@ async function main() {
 
   const tool = input.tool_name;
   const toolInput = input.tool_input || {};
+
+  // This hook now receives every Bash/write call. Keep ordinary calls on the
+  // hot path: no ledger, no session I/O, no output. Claude Code adds agent_type
+  // only for subagent calls, which is the provenance boundary for this relay.
+  if (tool !== 'Agent' && tool !== 'Workflow') {
+    const relay = policy?.agy?.agent;
+    if (typeof relay !== 'string' || input.agent_type !== relay) return;
+    const wrapper = join(ROOT, 'bin', 'agy-relay.sh').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const command = typeof toolInput.command === 'string' ? toolInput.command : '';
+    if (tool === 'Bash' && new RegExp(`^bash ${wrapper} --grant [a-f0-9]{48}$`).test(command)) return;
+    emit({
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse', permissionDecision: 'deny',
+        permissionDecisionReason: tool === 'Bash'
+          ? 'model-policy: the agy relay may only run its exact gate-issued grant command.'
+          : 'model-policy: the agy relay may only Read and run its exact gate-issued grant command.',
+      },
+    });
+    return;
+  }
 
   if (tool === 'Agent') {
     // A real spawn always carries a prompt string. If it does not, this payload is
@@ -123,6 +144,16 @@ async function main() {
     const isAgyRelayType = typeof agy.agent === 'string' && agy.agent.length > 0
       && currentType === agy.agent;
 
+    if (isAgyRelayType && offloadTag(toolInput.description, policy) === 'codex') {
+      emit({
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse', permissionDecision: 'deny',
+          permissionDecisionReason: 'model-policy: a direct agy relay spawn contradicts the higher-precedence [gpt] tag.',
+        },
+      });
+      return;
+    }
+
     // Naming the relay agent directly is a route into the subprocess that does
     // not pass the offload decision at all — so with offloading disabled, a
     // direct `subagent_type: "codex"` spawn would still run Codex, just without
@@ -205,6 +236,17 @@ async function main() {
     if (!offload && (tag?.startsWith('agy:') || !tag || isAgyRelayType)) {
       offload = resolveAgyOffload(toolInput, policy, offloadTier, currentType, record, input.cwd);
       offloadBackend = offload ? 'agy' : null;
+    }
+    if (offloadBackend === 'agy') {
+      const grant = issueAgyGrant({ ...offload, task: toolInput.prompt, sessionId: input.session_id });
+      // A relay without an immutable task/grant must never be spawned; retain
+      // the normal native route rather than hand it a forgeable preamble.
+      if (!grant) {
+        offload = null;
+        offloadBackend = null;
+      } else {
+        offload = { ...offload, grantId: grant.id, preamble: agyRelayPreamble(grant.id) };
+      }
     }
     let effectiveTier = tier;
     if (offload) {

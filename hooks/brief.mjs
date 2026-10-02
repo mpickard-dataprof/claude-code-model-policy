@@ -62,7 +62,7 @@ function agyBrief(policy, available) {
     const pools = agy.pools || {};
     const gemini = pools.gemini?.tag || '[gemini]';
     const thirdparty = pools.thirdparty?.tag || '[agy]';
-    return [`Antigravity tags \`${gemini}\` and \`${thirdparty}\` are inactive on this machine: install with \`curl -fsSL https://antigravity.google/cli/install.sh | bash\`, then run \`agy\` once to sign in.`];
+    return [`Antigravity tags \`${gemini}\` and \`${thirdparty}\` are inactive on this machine: they require the configured \`agy\` binary and Linux \`bwrap\` sandbox. Install agy with \`curl -fsSL https://antigravity.google/cli/install.sh | bash\`, install bubblewrap, then run \`agy\` once to sign in.`];
   }
   if (agy.enabled !== true || !agy.agent || !availableAgents().includes(agy.agent)) return [];
   const pools = agy.pools || {};
@@ -75,7 +75,8 @@ function agyBrief(policy, available) {
     `Tag a review with \`${gemini}\` to use Gemini. It is **reviews only** and always`,
     'read-only. Tag a review or a self-contained worktree development task with',
     `\`${thirdparty}\` to use the third-party pool. Development can edit only a named`,
-    '`.worktrees/` directory and has no shell, so run tests yourself afterwards.',
+    '`.worktrees/` directory. Every run is in a mandatory Linux bubblewrap sandbox;',
+    'Gemini remains on probation: verify every result and run tests yourself afterwards.',
     '',
     `If more than one offload tag appears, precedence is \`${policy.overrides?.codexTag || '[gpt]'}\` > \`${thirdparty}\` > \`${gemini}\`.`,
     spill.enabled === true

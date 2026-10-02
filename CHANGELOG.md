@@ -11,6 +11,9 @@
 - `bin/usage-snapshot.sh` and the `agy.usageSpill` policy: a fresh local
   status-line snapshot can spill untagged sonnet/opus tasks to Antigravity when
   either Claude usage window is high.
+- Antigravity now requires Linux bubblewrap. The gate creates a single-use grant,
+  the relay is limited to its exact grant command, and the wrapper mounts only
+  the permitted output/worktree and writable Antigravity state.
 
 ## 0.3.0 — offload to ChatGPT models, and `[hard]` means opus
 

@@ -136,8 +136,10 @@ Put a tag in the Agent task description to force a tier:
 `[gpt]` sends a generic task through the Codex relay. `[gemini]` sends a
 **review only** task through Antigravity's Gemini pool and is always read-only.
 `[agy]` uses Antigravity's third-party pool for reviews or development; edits are
-allowed only in a named `.worktrees/` directory and that mode has no shell, so
-run tests from the caller afterwards. If tags are combined, precedence is
+allowed only in a named `.worktrees/` directory. The gate issues a single-use
+grant and the relay can run only that grant command. Every Antigravity run is
+inside a mandatory Linux `bwrap` sandbox; without bubblewrap the tags are inactive
+(including on macOS). Gemini is on probation: verify every result. If tags are combined, precedence is
 `[gpt]` > `[agy]` > `[gemini]`.
 
 Antigravity auto-spills untagged sonnet/opus tasks when the configured Claude
@@ -148,8 +150,8 @@ receives Claude Code's status JSON:
 printf '%s' "$STATUS_JSON" | /absolute/path/to/model-policy/bin/usage-snapshot.sh
 ```
 
-The helper silently writes `usage.json` beside the install and does nothing when
-rate-limit values are absent.
+The helper silently writes a per-Claude-config `usage-<sha1>.json` beside the
+install and does nothing when rate-limit values are absent.
 
 ### Seeing what it did
 
@@ -304,7 +306,7 @@ resolves node explicitly.
 hooks/
   run.sh      launcher; resolves node explicitly
   brief.mjs   SessionStart  — record session model, brief Claude on the tiers
-  gate.mjs    PreToolUse    — set the model on Agent spawns; rewrite Workflow scripts
+  gate.mjs    PreToolUse    — route Agent/Workflow calls; lock down agy relay Bash grants
   log.mjs     SubagentStop  — record real token usage, outcome, and actual model
   lib.mjs     tier resolution, clamps, script rewriting, ledger
 agents/       scout.md, worker.md, architect.md — model + effort together

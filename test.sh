@@ -34,6 +34,7 @@ SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/model-policy-test.XXXXXX")"
 trap 'rm -rf "$SANDBOX"' EXIT INT TERM
 export MODEL_POLICY_LEDGER="$SANDBOX/ledger.jsonl"
 export MODEL_POLICY_SESSIONS="$SANDBOX/sessions"
+export MODEL_POLICY_GRANTS="$SANDBOX/grants"
 # $DIR stays the repo (policy.json, hooks); $SESS/$LEDG are the sandbox.
 SESS="$SANDBOX/sessions"
 LEDG="$SANDBOX/ledger.jsonl"
@@ -268,6 +269,11 @@ esac
 echo
 echo "== Fail-open =="
 check "unrelated tool ignored"         NOOP '{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"}}'
+RELAY_GRANT=dddddddddddddddddddddddddddddddddddddddddddddddd
+check "agy relay allows only exact grant command" NOOP "{\"session_id\":\"s\",\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\",\"agent_type\":\"agy\",\"tool_input\":{\"command\":\"bash $DIR/bin/agy-relay.sh --grant $RELAY_GRANT\"}}"
+check "agy relay denies chained Bash" DENY "{\"session_id\":\"s\",\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\",\"agent_type\":\"agy\",\"tool_input\":{\"command\":\"bash $DIR/bin/agy-relay.sh --grant $RELAY_GRANT; id\"}}"
+check "agy relay denies direct agy" DENY '{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Bash","agent_type":"agy","tool_input":{"command":"agy --dangerously-skip-permissions"}}'
+check "agy relay denies Write" DENY '{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Write","agent_type":"agy","tool_input":{"file_path":"/tmp/x"}}'
 check "malformed stdin"                NOOP 'not json at all'
 check "empty stdin"                    NOOP ''
 check "missing tool_input"             NOOP '{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Agent"}'
@@ -956,21 +962,15 @@ printf '{"model":"opus","via":"sessionstart","agents":["scout","worker","archite
 AGYTAG='"subagent_type":"general-purpose","description":"[agy] review the parser","prompt":"review the parser for correctness"'
 GEMTAG='"subagent_type":"general-purpose","description":"[gemini] review the parser","prompt":"review the parser for correctness"'
 redirect "[agy] swaps the type for the relay" agy "$(agent $S_AGY "$AGYTAG")"
-grepfield "[agy] names the third-party pool" prompt "pool: thirdparty" "$(agent $S_AGY "$AGYTAG")"
-grepfield "[agy] maps sonnet to its model" prompt "model: claude-sonnet-4-6" "$(agent $S_AGY "$AGYTAG")"
+grepfield "[agy] carries a gate grant" prompt "grant:" "$(agent $S_AGY "$AGYTAG")"
 redirect "[gemini] swaps the type for the relay" agy "$(agent $S_AGY "$GEMTAG")"
-grepfield "[gemini] names the Gemini pool" prompt "pool: gemini" "$(agent $S_AGY "$GEMTAG")"
-grepfield "[gemini] maps sonnet to its model" prompt "model: gemini-3.8-flash-medium" "$(agent $S_AGY "$GEMTAG")"
-grepfield "[agy] maps haiku to its model" prompt "model: gpt-oss-120b-medium" "$(agent $S_AGY '"subagent_type":"general-purpose","description":"[agy] find it","prompt":"find the auth config"')"
-grepfield "[gemini] maps haiku to its model" prompt "model: gemini-3.8-flash-low" "$(agent $S_AGY '"subagent_type":"general-purpose","description":"[gemini] find it","prompt":"find the auth config"')"
-grepfield "[agy] maps opus to its model" prompt "model: claude-opus-4-6-thinking" "$(agent $S_AGY '"subagent_type":"general-purpose","description":"[agy] [hard] design it","prompt":"design it"')"
-grepfield "[gemini] maps opus to its model" prompt "model: gemini-3.1-pro-high" "$(agent $S_AGY '"subagent_type":"general-purpose","description":"[gemini] [hard] design it","prompt":"design it"')"
+grepfield "[gemini] carries a gate grant" prompt "grant:" "$(agent $S_AGY "$GEMTAG")"
 FABLE_POLICY="$SANDBOX/agy-fable.json"
 "$NODE" -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));p.overrides.hardTier="fable";fs.writeFileSync(process.argv[2],JSON.stringify(p));' "$DIR/policy.json" "$FABLE_POLICY"
 FABLE_OUT="$(printf '%s' "$(agent $S_AGY '"subagent_type":"general-purpose","description":"[agy] [hard] design it","prompt":"design it"')" | env MODEL_POLICY_POLICY="$FABLE_POLICY" sh "$RUN" "$GATE" 2>/dev/null)"
-assert "[agy] maps fable to its model" yes "$(printf '%s' "$FABLE_OUT" | grep -q 'model: claude-opus-4-6-thinking' && echo yes || echo no)"
+assert "[agy] fable route carries a grant" yes "$(printf '%s' "$FABLE_OUT" | grep -q 'grant:' && echo yes || echo no)"
 redirect "[gpt] wins over both agy tags" codex "$(agent $S_AGY '"subagent_type":"general-purpose","description":"[gpt] [agy] [gemini] review","prompt":"review it"')"
-grepfield "[agy] wins over Gemini" prompt "pool: thirdparty" "$(agent $S_AGY '"subagent_type":"general-purpose","description":"[agy] [gemini] review","prompt":"review it"')"
+grepfield "[agy] wins over Gemini" prompt "grant:" "$(agent $S_AGY '"subagent_type":"general-purpose","description":"[agy] [gemini] review","prompt":"review it"')"
 redirect "agy leaves specialised built-ins alone" Explore "$(agent $S_AGY '"subagent_type":"Explore","description":"[agy] review","prompt":"find it"')"
 redirect "agy requires its relay at SessionStart" scout "$(agent $SESSION_READY '"subagent_type":"general-purpose","description":"[agy] find","prompt":"find it"')"
 
@@ -1017,7 +1017,7 @@ assert "agy ledger records pool and tag route" thirdparty/tag \
 assert "agy preamble strips to the bare task" match \
   "$("$NODE" --input-type=module -e '
     import {promptFingerprint, AGY_TASK_MARKER as M} from "'"$DIR"'/hooks/lib.mjs";
-    const p="AGY-OFFLOAD:\n  pool: thirdparty\n  model: claude-sonnet-4-6\n  wrapper: /Some Path/bin/agy-relay.sh\n  cwd: /x/.worktrees/y\n\ninstructions\n\n"+M+"\n\n";
+    const p="AGY-OFFLOAD:\n  grant: abcd1234\n  wrapper: /Some Path/bin/agy-relay.sh\n\ninstructions\n\n"+M+"\n\n";
     process.stdout.write(promptFingerprint(p+"review it")===promptFingerprint("review it")?"match":"MISMATCH");
   ')"
 
@@ -1050,27 +1050,29 @@ assert "SessionStart records executable fake agy available" true \
 FAKE_AGY_ROUTE="$(printf '%s' "$(agent $S_AGY_FAKE "$AGYTAG")" | env MODEL_POLICY_POLICY="$AGY_POLICY" sh "$RUN" "$GATE" 2>/dev/null)"
 assert "SessionStart availability enables fake agy routing" agy \
   "$(printf '%s' "$FAKE_AGY_ROUTE" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).hookSpecificOutput.updatedInput.subagent_type)}catch{process.stdout.write("NOOP")}})')"
-AGY_TASK="$SANDBOX/agy-task.md"; printf 'review this\n' > "$AGY_TASK"
-AGY_LOG="$SANDBOX/agy-argv.log"
-agy_wrap() { env MODEL_POLICY_POLICY="$AGY_POLICY" AGY_ARGV_LOG="$AGY_LOG" bash "$DIR/bin/agy-relay.sh" "$@" 2>&1; }
-mkdir -p "$SANDBOX/.worktrees/x"
-rm -f "$AGY_LOG"
-out="$(agy_wrap --task "$AGY_TASK" --pool thirdparty --model not-a-model --access read-only --cwd "$DIR")"
-assert "agy wrapper rejects an unknown model without launch" no "$(test -e "$AGY_LOG" && echo yes || echo no)"
-rm -f "$AGY_LOG"; out="$(agy_wrap --task "$AGY_TASK" --pool gemini --access edit --cwd "$SANDBOX/.worktrees/x")"
-assert "agy wrapper refuses Gemini edits without launch" no "$(test -e "$AGY_LOG" && echo yes || echo no)"
-rm -f "$AGY_LOG"; out="$(agy_wrap --task "$AGY_TASK" --pool thirdparty --access edit --cwd "$SANDBOX")"
-assert "agy wrapper refuses edits outside worktrees" no "$(test -e "$AGY_LOG" && echo yes || echo no)"
-rm -f "$AGY_LOG"; out="$(agy_wrap --task "$AGY_TASK" --pool thirdparty --access read-only --cwd "$DIR" --sandbox nope)"
-assert "agy wrapper refuses forbidden flags" no "$(test -e "$AGY_LOG" && echo yes || echo no)"
-rm -f "$AGY_LOG"; out="$(agy_wrap --task "$AGY_TASK" --pool thirdparty --access read-only --cwd /does/not/exist)"
-assert "agy wrapper refuses missing cwd without launch" no "$(test -e "$AGY_LOG" && echo yes || echo no)"
-out="$(agy_wrap --task "$AGY_TASK" --pool thirdparty --access edit --cwd "$SANDBOX/.worktrees/x")"
-assert "agy edit mode reaches the worker" yes "$(printf '%s' "$out" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).ok?"yes":"no")}catch{process.stdout.write("no")}})')"
+AGY_LOG="$SANDBOX/agy-argv.log"; BWRAP_LOG="$SANDBOX/bwrap-argv.log"
+FAKE_BWRAP="$SANDBOX/fake-bwrap"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\n" "$@" > "$BWRAP_ARGV_LOG"' 'while [ "$1" != -- ]; do shift; done; shift; exec "$@"' > "$FAKE_BWRAP"
+chmod +x "$FAKE_BWRAP"
+"$NODE" -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync(process.argv[1]));p.agy.binary=process.argv[2];p.agy.sandbox.bwrap=process.argv[3];fs.writeFileSync(process.argv[4],JSON.stringify(p));' "$DIR/policy.json" "$FAKE_AGY" "$FAKE_BWRAP" "$AGY_POLICY"
+mkdir -p "$SANDBOX/.worktrees/x" "$MODEL_POLICY_GRANTS"
+grant() { "$NODE" -e 'const fs=require("fs"),path=require("path");const [d,id,pool,model,access,cwd,task]=process.argv.slice(1);fs.writeFileSync(path.join(d,id+".task"),task,{mode:0o600});fs.writeFileSync(path.join(d,id+".json"),JSON.stringify({pool,model,access,cwd,task_path:path.join(d,id+".task"),session_id:"s",created:new Date().toISOString(),expires:new Date(Date.now()+3600000).toISOString()})+"\n",{mode:0o600});' "$MODEL_POLICY_GRANTS" "$@"; }
+agy_wrap() { env MODEL_POLICY_POLICY="$AGY_POLICY" AGY_ARGV_LOG="$AGY_LOG" BWRAP_ARGV_LOG="$BWRAP_LOG" bash "$DIR/bin/agy-relay.sh" "$@" 2>&1; }
+G1=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+grant "$G1" thirdparty claude-sonnet-4-6 edit "$SANDBOX/.worktrees/x" 'review this'
+out="$(agy_wrap --grant "$G1")"
+assert "agy edit grant reaches the worker" yes "$(printf '%s' "$out" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).ok?"yes":"no")}catch{process.stdout.write("no")}})')"
 assert "agy edit mode passes accept-edits" yes "$(grep -qx -- '--mode' "$AGY_LOG" && echo yes || echo no)"
-printf 'PERMDENY\n' > "$AGY_TASK"
-out="$(agy_wrap --task "$AGY_TASK" --pool thirdparty --access read-only --cwd "$DIR")"
-assert "agy detects permission-denied output" agy_permission_denied "$(printf '%s' "$out" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).reason||"")}catch{}})')"
+assert "bwrap has private tmp before worktree bind" yes "$(awk '$0=="/tmp"{a=NR} /\.worktrees\//{b=NR}END{print a<b?"yes":"no"}' "$BWRAP_LOG")"
+assert "used grant cannot be replayed" grant_already_used "$(agy_wrap --grant "$G1" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).reason)}catch{}})')"
+G2=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+grant "$G2" gemini gemini-3.8-flash-medium edit "$SANDBOX/.worktrees/x" 'bad'
+assert "forged Gemini edit grant is refused" grant_invalid "$(agy_wrap --grant "$G2" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).reason)}catch{}})')"
+G3=cccccccccccccccccccccccccccccccccccccccccccccccc
+grant "$G3" thirdparty claude-sonnet-4-6 read-only "$DIR" 'review'
+MISSING_BWRAP_POLICY="$SANDBOX/agy-no-bwrap.json"
+"$NODE" -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync(process.argv[1]));p.agy.sandbox.bwrap="/missing/bwrap";fs.writeFileSync(process.argv[2],JSON.stringify(p));' "$AGY_POLICY" "$MISSING_BWRAP_POLICY"
+assert "missing bwrap refuses before launch" sandbox_unavailable "$(env MODEL_POLICY_POLICY="$MISSING_BWRAP_POLICY" MODEL_POLICY_GRANTS="$MODEL_POLICY_GRANTS" bash "$DIR/bin/agy-relay.sh" --grant "$G3" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).reason)}catch{}})')"
 
 SNAP_OUT="$SANDBOX/snapshot.json"
 printf '%s' '{"rate_limits":{"five_hour":{"used_percentage":81}}}' | MODEL_POLICY_USAGE_SNAPSHOT="$SNAP_OUT" bash "$DIR/bin/usage-snapshot.sh"

@@ -142,6 +142,11 @@
     "binary": "$HOME/.local/bin/agy",
     "offloadableTypes": ["general-purpose", "claude", ""],
     "relayTier": "haiku",
+    "sandbox": {
+      "_comment": "Linux bubblewrap is mandatory: agy is unavailable when this executable is absent.",
+      "bwrap": "/usr/bin/bwrap",
+      "hide": ["$HOME/.ssh", "$HOME/.gnupg", "$HOME/.aws", "$HOME/.config/gcloud", "$HOME/.docker", "$HOME/.kube", "$HOME/.netrc"]
+    },
     "pools": {
       "gemini": {
         "tag": "[gemini]",

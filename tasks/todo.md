@@ -15,15 +15,12 @@ Two new offload backends via Google's `agy -p` CLI, parallel to `[gpt]`/Codex.
   Stale/missing snapshot -> no spill. Ledger records `offload_via: "auto:usage"`.
 
 ## Tasks
-- [ ] policy.json: `agy` block {enabled, agent, offloadableTypes, pools:{gemini:{tag,byTier}, thirdparty:{tag,byTier}}, relayTier, usageSpill:{enabled, pool, fiveHourPct, maxAgeSec, tiers}}
-- [ ] lib.mjs: generalize resolveCodexOffload -> backend resolver (codex | agy:<pool>); AGY-OFFLOAD preamble + marker; stripOffloadPreamble handles both; usage snapshot reader
-- [ ] gate.mjs: ledger fields `offload: "agy"`, `offload_pool`, `offload_via`
-- [ ] bin/agy-relay.sh + supervisor (validate model vs policy, cwd, worktree check for accept-edits, timeout, single JSON line out)
-- [ ] agents/agy.md relay agent (haiku/low), installed like codex.md
-- [ ] brief.mjs: document `[gemini]` / `[agy]` / usage spill
-- [ ] statusline snippet writing usage.json (atomic write)
-- [ ] test.sh: tag routing, pool maps, read-only vs worktree mode, usage spill (fresh/stale/missing/below threshold), preamble split, ledger
-- [ ] CHANGELOG 0.4.0, README
+- [x] policy.json + mandatory bubblewrap sandbox configuration
+- [x] gate/lib routing, immutable task files, single-use grants and relay lockdown
+- [x] agy wrapper: grant validation, sandboxed launch, and JSON outcome handling
+- [x] agy relay agent (Bash/Read only), SessionStart brief, per-account usage snapshot
+- [x] test.sh: routing, grants, relay hook, sandbox binds, usage spill and wrapper guards
+- [x] CHANGELOG 0.4.0, README
 - [ ] Reviews: Codex + Claude (Opus) on the diff; live smoke test of both pools; install + verify.sh
 
 ## Follow-up (after agy build lands)

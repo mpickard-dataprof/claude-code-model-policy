@@ -4,7 +4,25 @@
 # silent and never makes a status line fail.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SNAPSHOT="${MODEL_POLICY_USAGE_SNAPSHOT:-$ROOT/usage.json}"
+if [ -n "${MODEL_POLICY_USAGE_SNAPSHOT:-}" ]; then
+  SNAPSHOT="$MODEL_POLICY_USAGE_SNAPSHOT"
+else
+  CONFIG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+  REAL_CONFIG="$(python3 - "$CONFIG" <<'PY'
+import os,sys
+try: print(os.path.realpath(sys.argv[1]))
+except Exception: print('')
+PY
+)"
+  if [ -n "$REAL_CONFIG" ]; then
+    KEY="$(python3 - "$REAL_CONFIG" <<'PY'
+import hashlib,sys
+print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:12])
+PY
+)"
+    SNAPSHOT="$ROOT/usage-$KEY.json"
+  else SNAPSHOT="$ROOT/usage-unavailable.json"; fi
+fi
 INPUT="$(cat 2>/dev/null || true)"
 python3 - "$SNAPSHOT" "$INPUT" <<'PY' >/dev/null 2>&1 || true
 import json, os, sys, tempfile, time
