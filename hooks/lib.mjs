@@ -452,13 +452,12 @@ export function resolveCodexOffload(toolInput, policy, tier, currentType, record
 /** Resolve an Antigravity offload after the shared task tier has been scored. */
 export function resolveAgyOffload(toolInput, policy, tier, currentType, record, cwd) {
   const agy = policy.agy || {};
-  if (agy.enabled !== true) return null;
+  if (agy.enabled !== true || (Object.hasOwn(agy, 'agent') && agy.agent !== 'agy')) return null;
   // SessionStart checks the configured binary once. Older/recovered records have
   // no field and therefore fail closed: their agent definitions may be loaded,
   // but this machine's ability to execute Antigravity is unknown.
   if (record?.agy_available !== true) return null;
-  const agent = typeof agy.agent === 'string' && agy.agent.length > 0 ? agy.agent : null;
-  if (!agent) return null;
+  const agent = 'agy';
   const loaded = record?.via === 'sessionstart' && Array.isArray(record.agents);
   if (!loaded || !record.agents.includes(agent)) return null;
 

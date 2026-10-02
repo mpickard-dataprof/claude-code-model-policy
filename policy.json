@@ -138,7 +138,6 @@
   "agy": {
     "_comment1": "Offload to Google Antigravity through ~/.local/bin/agy, never the unrelated /usr/local/bin desktop launcher.",
     "enabled": true,
-    "agent": "agy",
     "binary": "$HOME/.local/bin/agy",
     "offloadableTypes": ["general-purpose", "claude", ""],
     "relayTier": "haiku",
@@ -146,11 +145,7 @@
     "sandbox": {
       "_comment": "Linux bubblewrap is mandatory: agy is unavailable when this executable is absent.",
       "bwrap": "/usr/bin/bwrap",
-      "hide": ["$HOME/.ssh", "$HOME/.gnupg", "$HOME/.aws", "$HOME/.claude*", "$HOME/.config", "$HOME/.local/share/keyrings", "$HOME/.docker", "$HOME/.kube", "$HOME/.netrc"],
-      "editMask": {
-        "dirs": [".claude", ".vscode", ".idea", ".github/workflows", ".husky"],
-        "files": [".mcp.json", ".envrc", "CLAUDE.md", "CLAUDE.local.md", "AGENTS.md", "GEMINI.md", ".claude.json"]
-      }
+      "hide": ["$HOME/.ssh", "$HOME/.gnupg", "$HOME/.aws", "$HOME/.claude*", "$HOME/.config", "$HOME/.local/share/keyrings", "$HOME/.docker", "$HOME/.kube", "$HOME/.netrc"]
     },
     "pools": {
       "gemini": {

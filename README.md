@@ -159,10 +159,11 @@ offload design—revoke it on the Google side with `agy logout` if needed.
 
 For edit runs, review the diff before running anything: edited tests, Makefiles,
 and package scripts run with your normal host permissions when you invoke them.
-The sandbox masks `.claude`, `.vscode`, `.idea`, `.github/workflows`, `.husky`,
-`.mcp.json`, `.envrc`, `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `GEMINI.md`,
-and `.claude.json` (configurable through `agy.sandbox.editMask`), so `[agy] [edit]`
-cannot edit those files.
+For `[agy] [edit]`, Antigravity works in a private throwaway copy of the checkout.
+After it exits, the relay validates the complete delta before copying it back: only
+ordinary files with safe non-dot path components are eligible; agent instructions,
+`node_modules`, executable-bit changes, oversized changes, and host conflicts reject
+the whole delta. The result JSON reports every applied path (or the rejected rule).
 The sandbox also mitigates, but cannot eliminate, same-UID pathname races; an
 attacker already executing as your user is outside its threat model.
 

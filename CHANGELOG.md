@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Hardened Antigravity edit runs: workers edit a disposable checkout copy and a
+  validated, conflict-checked delta is the only thing copied back.
+- Linked-worktree Git metadata and Antigravity runtime state now use validated,
+  private mounts; the relay identity is fixed to `agy`.
+
 ## 0.4.0 — Antigravity offload backends
 
 ### Added

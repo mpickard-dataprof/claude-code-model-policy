@@ -58,8 +58,7 @@ async function main() {
   // hot path: no ledger, no session I/O, no output. Claude Code adds agent_type
   // only for subagent calls, which is the provenance boundary for this relay.
   if (tool !== 'Agent' && tool !== 'Workflow') {
-    const relay = policy?.agy?.agent;
-    if (typeof relay !== 'string' || input.agent_type !== relay) return;
+    if (input.agent_type !== 'agy') return;
     const wrapper = join(ROOT, 'bin', 'agy-relay.sh').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const command = typeof toolInput.command === 'string' ? toolInput.command : '';
     // `(?![\\s\\S])` is an absolute end-of-string assertion.  JavaScript's `$`
@@ -159,10 +158,13 @@ async function main() {
     // with "Agent type not found".
     const cx = policy.codex || {};
     const agy = policy.agy || {};
+    // The installed relay identity is immutable. A stale/custom policy spelling
+    // is a kill switch, never an alias which escapes the fail-closed fallback.
+    const agyEnabled = agy.enabled === true
+      && (!Object.hasOwn(agy, 'agent') || agy.agent === 'agy');
     const isRelayType = typeof cx.agent === 'string' && cx.agent.length > 0
       && currentType === cx.agent;
-    const isAgyRelayType = typeof agy.agent === 'string' && agy.agent.length > 0
-      && currentType === agy.agent;
+    const isAgyRelayType = currentType === 'agy';
 
     if (isAgyRelayType && offloadTag(toolInput.description, policy) === 'codex') {
       emit({
@@ -201,21 +203,21 @@ async function main() {
       });
       return;
     }
-    if (isAgyRelayType && (agy.enabled !== true || record?.agy_available !== true)) {
+    if (isAgyRelayType && (agyEnabled !== true || record?.agy_available !== true)) {
       ledger({
         event: 'route', tool: 'Agent', session_id: input.session_id, tool_use_id: input.tool_use_id,
         agent_type: currentType, description: String(toolInput.description ?? '').slice(0, 120),
-        rule: agy.enabled !== true ? 'deny:agy-disabled' : 'deny:agy-unavailable', denied: true,
+        rule: agyEnabled !== true ? 'deny:agy-disabled' : 'deny:agy-unavailable', denied: true,
       }, policy.limits?.ledgerMaxBytes);
       emit({
         hookSpecificOutput: {
           hookEventName: 'PreToolUse', permissionDecision: 'deny',
           permissionDecisionReason:
-            agy.enabled !== true
+            agyEnabled !== true
               ? 'model-policy: Antigravity offload is disabled (agy.enabled is not true), so the '
-                + `\`${agy.agent}\` relay agent cannot be spawned. Use a normal agent type.`
+                + '`agy` relay agent cannot be spawned. Use a normal agent type.'
               : 'model-policy: Antigravity is unavailable for this session, so the '
-                + `\`${agy.agent}\` relay agent cannot be spawned. Use a normal agent type.`,
+                + '`agy` relay agent cannot be spawned. Use a normal agent type.',
         },
       });
       return;
@@ -254,7 +256,7 @@ async function main() {
       offloadBackend = offload ? 'codex' : null;
     }
     let agyCwdRejected = false;
-    if (!offload && (tag?.startsWith('agy:') || !tag || isAgyRelayType)) {
+    if (agyEnabled && !offload && (tag?.startsWith('agy:') || !tag || isAgyRelayType)) {
       if (!agyCwdAllowed(input.cwd)) {
         // Do not spawn a relay merely to fail in the wrapper: native routing is
         // safe, and this ledger entry makes the fallback observable.

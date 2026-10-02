@@ -20,10 +20,10 @@ case "$GRANT_ID" in *[!abcdef0123456789]*) fail invalid_grant_id ;; esac
 [ "${#GRANT_ID}" -eq 48 ] || fail invalid_grant_id
 GRANTS="${MODEL_POLICY_GRANTS:-$ROOT/grants}"; GRANT="$GRANTS/$GRANT_ID.json"
 # Validate before consuming; os.replace makes a racing second caller see used.
-GRANT_DATA="$(python3 - "$GRANT" "$GRANTS" "$POLICY" <<'PY'
+GRANT_DATA="$(python3 - "$GRANT" "$GRANTS" "$POLICY" "$ROOT" <<'PY'
 import json,os,sys,time,subprocess,stat
 from datetime import datetime
-p,grants,policy_path=sys.argv[1:]
+p,grants,policy_path,root=sys.argv[1:]
 def die(r): print(json.dumps({'error':r})); raise SystemExit
 if not os.path.isfile(p): die('grant_already_used' if os.path.exists(p+'.used') else 'grant_missing')
 try: g=json.load(open(p)); a=(json.load(open(policy_path)).get('agy') or {})
@@ -51,6 +51,11 @@ if g['access']=='edit':
  try: git_mode=os.lstat(git).st_mode
  except Exception: die('grant_invalid')
  if not (stat.S_ISREG(git_mode) or stat.S_ISDIR(git_mode)): die('grant_invalid')
+ try:
+  chain=json.loads(subprocess.check_output([sys.executable,os.path.join(root,'bin','agy-git-chain.py'),cwd],text=True))
+  if chain.get('valid') is not True: die('grant_invalid')
+ except SystemExit: raise
+ except Exception: die('grant_invalid')
  try:
   top=os.path.realpath(subprocess.check_output(['git','-C',cwd,'rev-parse','--show-toplevel'],stderr=subprocess.DEVNULL,text=True).strip())
   if top != cwd: die('grant_invalid')
@@ -91,16 +96,14 @@ BINARY="$(realpath "$BINARY")" || fail agy_binary_unavailable
 # Linked worktrees use a .git file which points into the main checkout's common
 # git directory.  Re-expose that directory so ordinary read-only git commands
 # still work without making the rest of the user's home visible.
-GIT_COMMON_DIR="$(git -C "$CWD" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
-if [ -n "$GIT_COMMON_DIR" ] && [ -d "$GIT_COMMON_DIR" ]; then
-  GIT_COMMON_DIR="$(realpath "$GIT_COMMON_DIR")"
-else
-  GIT_COMMON_DIR=""
-fi
+GIT_COMMON_DIR="$(python3 "$ROOT/bin/agy-git-chain.py" "$CWD" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("common", ""))' 2>/dev/null || true)"
 
 OUTBASE="${MODEL_POLICY_AGY_OUTBASE:-${TMPDIR:-/tmp}}"
 OUTDIR="$(mktemp -d "$OUTBASE/agy-relay.XXXXXX")" || fail could_not_create_output_dir
 PRIVTMP="$(mktemp -d "$OUTBASE/agy-private.XXXXXX")" || fail could_not_create_private_tmp
+COPYDIR=""
+cleanup_private() { [ -z "$COPYDIR" ] || rm -rf -- "$COPYDIR"; rm -rf -- "$PRIVTMP"; }
+trap cleanup_private EXIT INT TERM
 OUT="$OUTDIR/answer.md"; ERR="$OUTDIR/stderr.log"; PROMPT_FILE="$OUTDIR/prompt.txt"
 # agy needs a read_file grant for anything outside its workspace, which headless
 # mode auto-denies, so the task is copied into OUTDIR and OUTDIR joins the workspace.
@@ -108,6 +111,65 @@ TASK_COPY="$OUTDIR/task.md"; cp "$TASK" "$TASK_COPY" || fail could_not_copy_task
 TASK_IN_BOX="/relay/task.md"
 PROMPT="You are a headless delegated subagent. You are already in the project directory; list and read files with your file tools. Do not use find (it is not allowed and aborts the run). Never run tests, builds, installers or scripts: the caller runs them, and any command outside the allowed read-only list aborts your whole run and discards your reply. Read the task file at $TASK_IN_BOX with your file-viewing tool; prefer that tool over a shell. If you use the shell, use only single simple allowed commands (chains only when every command is allowed). Writes outside the permitted directory are blocked by an OS sandbox and will fail. Report failures honestly; never claim a write or command succeeded without its output."
 printf '%s\n' "$PROMPT" > "$PROMPT_FILE"
+
+# Edit workers never see the real checkout writable.  Make a private, ordinary
+# file copy from Git's tracked + unignored view, then copy back only a validated
+# manifest delta after the worker is gone.
+BASELINE="$PRIVTMP/edit-baseline.json"
+if [ "$ACCESS" = edit ]; then
+  COPYDIR="$(mktemp -d "$OUTBASE/agy-edit.XXXXXX")" || fail could_not_create_edit_copy
+  python3 - "$CWD" "$COPYDIR" "$BASELINE" <<'PY' || fail could_not_copy_edit_workspace
+import hashlib,json,os,stat,subprocess,sys
+src,dst,manifest=sys.argv[1:]
+def bad(): raise RuntimeError('unsafe git path')
+def digest(fd):
+ h=hashlib.sha256()
+ while True:
+  b=os.read(fd,65536)
+  if not b: return h.hexdigest()
+  h.update(b)
+paths=subprocess.check_output(['git','-C',src,'ls-files','-z','-c','-o','--exclude-standard'])
+base={}
+for raw in paths.split(b'\0'):
+ if not raw: continue
+ rel=os.fsdecode(raw)
+ parts=rel.split('/')
+ if os.path.isabs(rel) or not rel or any(x in ('','.', '..') for x in parts): bad()
+ full=os.path.join(src,rel)
+ try: st=os.lstat(full)
+ except FileNotFoundError: continue
+ if not stat.S_ISREG(st.st_mode): continue
+ if os.path.commonpath([src,os.path.realpath(full)]) != src: bad()
+ target=os.path.join(dst,rel); os.makedirs(os.path.dirname(target),mode=0o700,exist_ok=True)
+ infd=os.open(full,os.O_RDONLY|os.O_NOFOLLOW)
+ try:
+  fst=os.fstat(infd)
+  if not stat.S_ISREG(fst.st_mode): continue
+  outfd=os.open(target,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+  try:
+   h=hashlib.sha256()
+   while True:
+    b=os.read(infd,65536)
+    if not b: break
+    h.update(b); os.write(outfd,b)
+   os.fsync(outfd)
+  finally: os.close(outfd)
+ finally: os.close(infd)
+ mode=stat.S_IMODE(fst.st_mode)
+ # The private copy is writable by this run even when a host file is readonly;
+ # retain only owner permissions, including executability when it had any.
+ os.chmod(target,0o600 | (0o100 if mode & 0o111 else 0))
+ base[rel]={'sha256':h.hexdigest(),'mode':mode,'host_sha256':h.hexdigest()}
+with open(manifest,'w',encoding='utf-8') as f: json.dump(base,f,sort_keys=True)
+PY
+  # bwrap needs a destination with the same kind as the readonly host .git
+  # overlay. It is excluded from the manifest and is never copied back.
+  if [ -d "$CWD/.git" ] && [ ! -L "$CWD/.git" ]; then
+    mkdir -p "$COPYDIR/.git" || fail could_not_prepare_edit_git_mount
+  else
+    : > "$COPYDIR/.git" || fail could_not_prepare_edit_git_mount
+  fi
+fi
 
 # A tmpfs root lets us create /workspace before any readonly host mount. Only
 # the runtime system directories needed by the CLI are exposed below.
@@ -149,50 +211,9 @@ ensure_box_parents() {
 ARGS+=(--bind "$PRIVTMP" /tmp)
 # The captured realpath is intentionally mounted at a fixed destination: a
 # same-UID rename cannot turn the in-box workspace into a different pathname.
-if [ "$ACCESS" = edit ]; then ARGS+=(--bind "$CWD" /workspace); else ARGS+=(--ro-bind "$CWD" /workspace); fi
+if [ "$ACCESS" = edit ]; then ARGS+=(--bind "$COPYDIR" /workspace); else ARGS+=(--ro-bind "$CWD" /workspace); fi
 if [ -n "$GIT_COMMON_DIR" ]; then ensure_box_parents "$GIT_COMMON_DIR"; ARGS+=(--ro-bind "$GIT_COMMON_DIR" "$GIT_COMMON_DIR"); fi
 if [ "$ACCESS" = edit ]; then ARGS+=(--ro-bind "$CWD/.git" /workspace/.git); fi
-
-# An edit worker may change source files, but never leave host-executed editor,
-# agent, CI, or shell configuration behind. Directories are private tmpfses;
-# files are rebound readonly (or /dev/null when absent) so they cannot be made.
-# bwrap must create a mount point for each absent mask on the host side of the rw
-# bind; remember those (and any parent dirs) so the empty placeholders are removed.
-MASK_CREATED=()
-if [ "$ACCESS" = edit ]; then
-  while IFS=$'\t' read -r kind name; do
-    case "$name" in ''|/*|*'..'*) continue ;; esac
-    target="/workspace/$name"; source="$CWD/$name"
-    if [ ! -e "$source" ] && [ ! -L "$source" ]; then
-      rel="$name"; parents=()
-      while [ "$(dirname "$rel")" != . ]; do rel="$(dirname "$rel")"; [ -e "$CWD/$rel" ] || parents=("$CWD/$rel" "${parents[@]}"); done
-      MASK_CREATED+=("${parents[@]}" "$source")
-    fi
-    if [ "$kind" = D ]; then
-      ARGS+=(--tmpfs "$target")
-    elif [ "$kind" = F ]; then
-      if [ -f "$source" ]; then ARGS+=(--ro-bind "$source" "$target"); else ARGS+=(--ro-bind /dev/null "$target"); fi
-    fi
-  done < <(python3 - "$POLICY" <<'PY'
-import json,sys
-default={'dirs':['.claude','.vscode','.idea','.github/workflows','.husky'],
-         'files':['.mcp.json','.envrc','CLAUDE.md','CLAUDE.local.md','AGENTS.md','GEMINI.md','.claude.json']}
-try:
- s=((json.load(open(sys.argv[1])).get('agy') or {}).get('sandbox') or {})
- m=s.get('editMask',default)
- if isinstance(m,list):
-  # List form is supported for simple custom policies; known directory entries
-  # retain directory semantics and all other entries are file masks.
-  dirs=set(default['dirs'])
-  m={'dirs':[x for x in m if x in dirs], 'files':[x for x in m if x not in dirs]}
- for x in m.get('dirs',[]):
-  if isinstance(x,str): print('D\t'+x)
- for x in m.get('files',[]):
-  if isinstance(x,str): print('F\t'+x)
-except Exception: pass
-PY
-)
-fi
 
 # Apply hiding only after cwd/git binds. In particular, never skip a $HOME path:
 # a future unsafe bind cannot accidentally punch through this deny list.
@@ -214,25 +235,30 @@ PY
 )
 
 # Gemini configuration is code-adjacent input, so the whole tree stays readonly.
-# Only the CLI's observed runtime state is writable, and each target is rebound
-# after the readonly parent. Create the state targets outside the box first.
+# The CLI's mutable state is always a fresh private tree; never create or bind a
+# writable host state path, even when the host happens to have one already.
 GEMINI="$HOME/.gemini"; AGY_STATE="$GEMINI/antigravity-cli"
 if [ -d "$GEMINI" ]; then
-  mkdir -p "$AGY_STATE"/{brain,conversations,cache,log,implicit,annotations,crashes,presence} 2>/dev/null || true
-  for f in history.jsonl conversation_summaries.db jetski_state.pbtxt jetbox_summaries_proto.pb last_check.timestamp; do
-    [ -e "$AGY_STATE/$f" ] || : > "$AGY_STATE/$f" 2>/dev/null || true
+  PRIVATE_STATE="$PRIVTMP/agy-state"; mkdir -p "$PRIVATE_STATE/bin"
+  for p in brain conversations cache log implicit annotations crashes presence; do mkdir -p "$PRIVATE_STATE/$p"; done
+  for f in history.jsonl conversation_summaries.db jetski_state.pbtxt jetbox_summaries_proto.pb last_check.timestamp cli.log; do
+    if [ -f "$AGY_STATE/$f" ] && [ ! -L "$AGY_STATE/$f" ]; then cp -- "$AGY_STATE/$f" "$PRIVATE_STATE/$f"; else : > "$PRIVATE_STATE/$f"; fi
   done
   ensure_box_parents "$GEMINI"
   ARGS+=(--ro-bind "$GEMINI" "$GEMINI")
-  for p in brain conversations cache log implicit annotations crashes presence history.jsonl conversation_summaries.db jetski_state.pbtxt jetbox_summaries_proto.pb last_check.timestamp; do
-    [ -e "$AGY_STATE/$p" ] && ARGS+=(--bind "$AGY_STATE/$p" "$AGY_STATE/$p")
-  done
+  if [ -d "$AGY_STATE" ]; then
+    for p in brain conversations cache log implicit annotations crashes presence history.jsonl conversation_summaries.db jetski_state.pbtxt jetbox_summaries_proto.pb last_check.timestamp cli.log; do
+      ARGS+=(--bind "$PRIVATE_STATE/$p" "$AGY_STATE/$p")
+    done
+  else
+    ARGS+=(--bind "$PRIVATE_STATE" "$AGY_STATE")
+  fi
 fi
 # agy rewrites bin/agentapi (a shim that execs the agy binary by its real path)
 # before every shell command. The host copy must stay readonly - an unsandboxed
 # agy would later run whatever a box wrote there - so each run gets a private,
 # throwaway bin/ and the binary is also visible readonly at its real path.
-if [ -d "$GEMINI" ]; then mkdir -p "$AGY_STATE/bin" 2>/dev/null || true; ARGS+=(--tmpfs "$AGY_STATE/bin"); fi
+if [ -d "$GEMINI" ] && [ -d "$AGY_STATE" ]; then ARGS+=(--tmpfs "$AGY_STATE/bin"); fi
 ARGS+=(--ro-bind "$BINARY" /agy)
 ensure_box_parents "$BINARY"; ARGS+=(--ro-bind "$BINARY" "$BINARY")
 # /relay contains task input only. Worker stdout is captured through the
@@ -275,14 +301,120 @@ try:
 except Exception: pass
 PY
 )"
-# Deepest first: drop placeholders only while they are still empty and untouched.
-for (( i=${#MASK_CREATED[@]}-1; i>=0; i-- )); do
-  p="${MASK_CREATED[$i]}"
-  if [ -f "$p" ] && [ ! -L "$p" ] && [ ! -s "$p" ]; then rm -f -- "$p"; elif [ -d "$p" ] && [ ! -L "$p" ]; then rmdir -- "$p" 2>/dev/null || true; fi
-done
-NESTED_GIT=""
-[ "$ACCESS" = edit ] && NESTED_GIT="$(find "$CWD" -mindepth 2 -name .git -print -quit 2>/dev/null || true)"
-python3 - "$SUP" "$POOL" "$MODEL" "$ACCESS" "$CWD" "$OUT" "$ERR" "$FORCED_REASON" "$NESTED_GIT" <<'PY'
+EDIT_RESULT='{}'
+if [ "$ACCESS" = edit ]; then
+  EDIT_RESULT="$(python3 - "$CWD" "$COPYDIR" "$BASELINE" <<'PY'
+import hashlib,json,os,re,stat,sys,tempfile
+cwd,copy,baseline_path=sys.argv[1:]
+base=json.load(open(baseline_path,encoding='utf-8'))
+valid_component=re.compile(r'^[A-Za-z0-9_][A-Za-z0-9._+-]*$')
+deny={'claude.md','claude.local.md','agents.md','agent.md','gemini.md','node_modules'}
+def sha(path):
+ h=hashlib.sha256()
+ with open(path,'rb') as f:
+  for b in iter(lambda:f.read(65536),b''): h.update(b)
+ return h.hexdigest()
+def reject(rule,path): print(json.dumps({'ok':False,'reason':'edit_rejected:'+rule+':'+path,'rejected':{'rule':rule,'path':path}})); raise SystemExit
+def conflict(path): print(json.dumps({'ok':False,'reason':'edit_conflict','rejected':{'rule':'edit_conflict','path':path}})); raise SystemExit
+def path_ok(rel):
+ parts=rel.split('/')
+ return bool(rel) and len(rel)<=1024 and all(valid_component.match(x) and x.lower() not in deny for x in parts)
+current={}; dirs=[]
+for root,ds,fs in os.walk(copy,followlinks=False):
+ relroot=os.path.relpath(root,copy)
+ # .git is a bwrap mountpoint, never part of the worker's change set.
+ if relroot=='.git': ds[:]=[]; continue
+ for n in list(ds)+list(fs):
+  p=os.path.join(root,n); rel=os.path.relpath(p,copy)
+  if rel=='.git' or rel.startswith('.git/'): continue
+  st=os.lstat(p)
+  if stat.S_ISDIR(st.st_mode): dirs.append(rel); continue
+  current[rel]={'mode':stat.S_IMODE(st.st_mode),'regular':stat.S_ISREG(st.st_mode),'nlink':st.st_nlink,'size':st.st_size,'sha256':sha(p) if stat.S_ISREG(st.st_mode) else None}
+base_dirs=set()
+for p in base:
+ parts=p.split('/')[:-1]
+ for i in range(1,len(parts)+1): base_dirs.add('/'.join(parts[:i]))
+# A baseline file replaced with a directory would otherwise look like a safe
+# deletion plus children. It is a non-regular replacement and rejects whole
+# delta before any host write.
+for p in dirs:
+ if p in base: reject('non_regular',p)
+added=sorted(set(current)-set(base)); deleted=sorted(set(base)-set(current)); modified=sorted(p for p in set(current)&set(base) if not current[p]['regular'] or current[p]['sha256']!=base[p]['sha256'] or bool(current[p]['mode']&0o111)!=bool(base[p]['mode']&0o111))
+changed=added+modified+deleted
+for p in changed:
+ if not path_ok(p): reject('path',p)
+# Git treats any directory holding HEAD + objects/ + refs/ as a bare repository
+# and obeys its config (core.fsmonitor, hooks) when run inside it, whatever the
+# name. Reject a delta that names or completes such a directory.
+for p in added+modified:
+ if any(x.lower().endswith('.git') for x in p.split('/')[:-1]): reject('git_repo',p)
+ d=os.path.join(copy,os.path.dirname(p))
+ while True:
+  if os.path.isfile(os.path.join(d,'HEAD')) and os.path.isdir(os.path.join(d,'objects')) and os.path.isdir(os.path.join(d,'refs')): reject('git_repo',p)
+  if os.path.samefile(d,copy): break
+  d=os.path.dirname(d)
+for p in added+modified:
+ x=current[p]
+ if not x['regular'] or x['nlink'] != 1: reject('non_regular',p)
+ if x['size'] > 5*1024*1024: reject('file_too_large',p)
+ if p in base and bool(x['mode']&0o111) != bool(base[p]['mode']&0o111): reject('mode_change',p)
+for p in deleted:
+ if p not in base: reject('delete_invalid',p)
+if len(changed)>500: reject('too_many_paths',changed[500])
+if sum(current[p]['size'] for p in added+modified) > 20*1024*1024: reject('too_many_bytes',(added+modified)[0] if added+modified else '')
+# Empty new directories are not copied back. A non-empty directory can only be a
+# parent of an accepted file; reject node_modules even when it is otherwise empty.
+for d in dirs:
+ if d not in base_dirs:
+  if any(x.lower() in deny for x in d.split('/')): reject('path',d)
+  if not any(p.startswith(d+'/') for p in added+modified): continue
+# Check every host precondition before a single write.
+host_modes={}
+for p in added:
+ if os.path.lexists(os.path.join(cwd,p)): conflict(p)
+for p in modified+deleted:
+ hp=os.path.join(cwd,p)
+ try: st=os.lstat(hp)
+ except FileNotFoundError: conflict(p)
+ if not stat.S_ISREG(st.st_mode) or sha(hp)!=base[p]['host_sha256']: conflict(p)
+ host_modes[p]=stat.S_IMODE(st.st_mode)
+def parent(rel):
+ st=os.lstat(cwd)
+ if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode): raise RuntimeError('unsafe parent')
+ d=cwd
+ for part in rel.split('/')[:-1]:
+  d=os.path.join(d,part)
+  try: st=os.lstat(d)
+  except FileNotFoundError:
+   os.mkdir(d,0o755); st=os.lstat(d)
+  if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode): raise RuntimeError('unsafe parent')
+ return d
+try:
+ # Resolve (and, where needed, create) every parent before touching a host file,
+ # so an unsafe parent cannot yield a partially applied change set.
+ for p in added+modified: parent(p)
+ for p in added+modified:
+  d=parent(p); mode=0o644 if p in added else host_modes[p]
+  tmp=os.path.join(d,'.agy-copy-'+next(tempfile._get_candidate_names()))
+  fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+  try:
+   with os.fdopen(fd,'wb') as o, open(os.path.join(copy,p),'rb') as i:
+    for b in iter(lambda:i.read(65536),b''): o.write(b)
+    o.flush(); os.fsync(o.fileno())
+   os.chmod(tmp,mode); os.replace(tmp,os.path.join(cwd,p))
+  finally:
+   if os.path.exists(tmp): os.unlink(tmp)
+ for p in deleted:
+  hp=os.path.join(cwd,p); st=os.lstat(hp)
+  if not stat.S_ISREG(st.st_mode): raise RuntimeError('unsafe delete')
+  os.unlink(hp)
+except Exception:
+ print(json.dumps({'ok':False,'reason':'edit_rejected:apply_failed:','rejected':{'rule':'apply_failed','path':''}})); raise SystemExit
+print(json.dumps({'ok':True,'changes':{'added':added,'modified':modified,'deleted':deleted}}))
+PY
+)"
+fi
+python3 - "$SUP" "$POOL" "$MODEL" "$ACCESS" "$CWD" "$OUT" "$ERR" "$FORCED_REASON" "$EDIT_RESULT" <<'PY'
 import json,os,re,stat,sys
 def safe_read(path):
  try:
@@ -300,7 +432,7 @@ def safe_read(path):
  except Exception: return b'',0
 try: result=json.loads(sys.argv[1])
 except Exception: result={'ok':False,'exit_code':2,'reason':'supervisor produced invalid JSON'}
-pool,model,access,cwd,out,err,forced,nested=sys.argv[2:]
+pool,model,access,cwd,out,err,forced,edit=sys.argv[2:]
 # The supervisor already marks an empty answer as failed; name the real cause when
 # agy says a headless permission prompt was auto-denied.
 try:
@@ -309,14 +441,19 @@ try:
  if answer_size==0 and any(x.startswith('jetski: no output produced') for x in stderr.splitlines()):
   m=re.search(r'"([a-z_]+)" permission',stderr)
   result['ok']=False; result['reason']='agy_permission_denied:'+(m.group(1) if m else 'unknown')
-  # An edit run can be cut off after it has already changed files.
-  if access=='edit': result['edits_may_exist']=True; result['check']='git -C %s status --short' % cwd
 except Exception: pass
 result.update({'pool':pool,'model':model,'access':access,'cwd':cwd}); result.pop('effort',None); result.pop('sandbox',None)
 if forced:
  result.update({'ok':False,'reason':forced})
-if nested:
- result.update({'ok':False,'reason':'nested_git_created'})
+if access=='edit':
+ try:
+  e=json.loads(edit)
+  if e.get('changes') is not None: result['changes']=e['changes']
+  if not e.get('ok',False):
+   result.update({'ok':False,'reason':e.get('reason','edit_rejected:unknown:')})
+   if e.get('rejected') is not None: result['rejected']=e['rejected']
+ except Exception:
+  result.update({'ok':False,'reason':'edit_rejected:validation_failed:'})
 cap=200*1024
 answer,answer_size=safe_read(out); truncated=answer_size>cap
 result['truncated']=truncated
