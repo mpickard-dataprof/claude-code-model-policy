@@ -23,6 +23,15 @@ if [ -z "$NODE" ]; then
 fi
 [ -z "$NODE" ] && { echo "no usable node found"; exit 1; }
 
+# Antigravity deliberately has an absolute configured binary: /usr/local/bin/agy
+# is an unrelated desktop launcher. Missing it is a capability warning, not a
+# policy failure — native routing remains safe.
+AGY_BIN="$("$NODE" -e 'try { const a=require(process.argv[1]).agy||{}; process.stdout.write(a.binary||"$HOME/.local/bin/agy"); } catch {}' "$ROOT/policy.json" 2>/dev/null)"
+case "$AGY_BIN" in '$HOME'/*) AGY_BIN="$HOME/${AGY_BIN#\$HOME/}" ;; esac
+if [ -n "$AGY_BIN" ] && [ ! -x "$AGY_BIN" ]; then
+  echo "warning: Antigravity binary is not executable: $AGY_BIN"
+fi
+
 "$NODE" -e '
 const fs = require("fs"), path = require("path");
 const root = process.argv[1];

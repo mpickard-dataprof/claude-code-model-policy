@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.0 — Antigravity offload backends
+
+### Added
+
+- `[gemini]` and `[agy]` offload tags through the `agy` relay. Gemini is reviews
+  only and always read-only; the third-party pool also supports constrained edits
+  in a named `.worktrees/` directory. Tag precedence is `[gpt]` > `[agy]` >
+  `[gemini]`.
+- `bin/usage-snapshot.sh` and the `agy.usageSpill` policy: a fresh local
+  status-line snapshot can spill untagged sonnet/opus tasks to Antigravity when
+  either Claude usage window is high.
+
 ## 0.3.0 — offload to ChatGPT models, and `[hard]` means opus
 
 ### Added

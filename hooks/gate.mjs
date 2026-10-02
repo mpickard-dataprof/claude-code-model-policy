@@ -11,7 +11,8 @@ import {
   readStdin, parseJson, loadPolicy, resolveTier, sessionRecordFor, normalizeModel,
   sessionTierFromTranscript, writeSessionTier, tierIndex, promptFingerprint,
   stripCodeNoise, injectWorkflowTiers, resolveWorkflowScript, sessionTierFor,
-  ledger, emit, recordSessionEvent, promptHash, resolveCodexOffload,
+  ledger, emit, recordSessionEvent, promptHash, resolveCodexOffload, resolveAgyOffload,
+  offloadTag,
 } from './lib.mjs';
 
 // How long a cached session model is trusted before the transcript is re-read.
@@ -113,8 +114,11 @@ async function main() {
     // been on disk when this session loaded its definitions, or the spawn dies
     // with "Agent type not found".
     const cx = policy.codex || {};
+    const agy = policy.agy || {};
     const isRelayType = typeof cx.agent === 'string' && cx.agent.length > 0
       && currentType === cx.agent;
+    const isAgyRelayType = typeof agy.agent === 'string' && agy.agent.length > 0
+      && currentType === agy.agent;
 
     // Naming the relay agent directly is a route into the subprocess that does
     // not pass the offload decision at all — so with offloading disabled, a
@@ -143,6 +147,22 @@ async function main() {
       });
       return;
     }
+    if (isAgyRelayType && agy.enabled !== true) {
+      ledger({
+        event: 'route', tool: 'Agent', session_id: input.session_id, tool_use_id: input.tool_use_id,
+        agent_type: currentType, description: String(toolInput.description ?? '').slice(0, 120),
+        rule: 'deny:agy-disabled', denied: true,
+      }, policy.limits?.ledgerMaxBytes);
+      emit({
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse', permissionDecision: 'deny',
+          permissionDecisionReason:
+            'model-policy: Antigravity offload is disabled (agy.enabled is not true), so the '
+            + `\`${agy.agent}\` relay agent cannot be spawned. Use a normal agent type.`,
+        },
+      });
+      return;
+    }
 
     // Score a DIRECT relay call as if the type had not been named.
     //
@@ -155,7 +175,7 @@ async function main() {
     // at high. Same work, quietly weaker worker, and a clean exit hiding it.
     let offloadTier = tier;
     let offloadRule = rule;
-    if (isRelayType) {
+    if (isRelayType || isAgyRelayType) {
       const scored = resolveTier({ ...toolInput, subagent_type: '' }, policy, sessionTier);
       if (tierIndex(scored.tier, policy.tierOrder) !== null) {
         offloadTier = scored.tier;
@@ -166,7 +186,20 @@ async function main() {
       }
     }
 
-    const offload = resolveCodexOffload(toolInput, policy, offloadTier, currentType, record);
+    // Explicit tags are authoritative across backends: [gpt] > [agy] > [gemini].
+    // With no tag, preserve Codex's existing auto route before considering the
+    // usage-window spill; the shipped Codex auto list is empty.
+    const tag = offloadTag(toolInput.description, policy);
+    let offload = null;
+    let offloadBackend = null;
+    if (tag === 'codex' || !tag) {
+      offload = resolveCodexOffload(toolInput, policy, offloadTier, currentType, record);
+      offloadBackend = offload ? 'codex' : null;
+    }
+    if (!offload && (tag?.startsWith('agy:') || !tag || isAgyRelayType)) {
+      offload = resolveAgyOffload(toolInput, policy, offloadTier, currentType, record, input.cwd);
+      offloadBackend = offload ? 'agy' : null;
+    }
     let effectiveTier = tier;
     if (offload) {
       // The relay agent itself only shells out and reads a file back, so it runs
@@ -193,7 +226,7 @@ async function main() {
         event: 'error',
         reason: 'routing produced a tier that is not in tierOrder',
         tier: effectiveTier, scored_tier: tier, rule,
-        offload: offload ? 'codex' : null,
+        offload: offloadBackend,
         session_id: input.session_id,
       }, policy.limits?.ledgerMaxBytes);
       return; // leave the spawn alone rather than emit a model that cannot run
@@ -227,12 +260,15 @@ async function main() {
       // it says what the work was worth, not what the courier cost.
       scored_tier: offload ? offloadTier : tier,
       redirect_to: redirectTo,
-      offload: offload ? 'codex' : null,
+      offload: offloadBackend,
+      offload_pool: offloadBackend === 'agy' ? offload.pool : null,
       offload_model: offload?.model ?? null,
-      offload_effort: offload?.effort ?? null,
+      offload_effort: offloadBackend === 'codex' ? offload?.effort ?? null : null,
       offload_via: offload?.via ?? null,
       rule: offload
-        ? `${offloadRule}+offload:codex/${offload.model}`
+        ? (offloadBackend === 'agy'
+          ? `${offloadRule}+offload:agy/${offload.pool}/${offload.model}`
+          : `${offloadRule}+offload:codex/${offload.model}`)
         : (redirectTo ? `${rule}+redirect:${redirectTo}` : rule),
       changed,
     }, policy.limits?.ledgerMaxBytes);
@@ -266,7 +302,9 @@ async function main() {
         hookEventName: 'PreToolUse',
         permissionDecision: 'allow',
         permissionDecisionReason: offload
-          ? `model-policy: offload to codex ${offload.model} (effort ${offload.effort}, scored ${offloadTier}, ${offloadRule})`
+          ? (offloadBackend === 'agy'
+            ? `model-policy: offload to agy ${offload.pool}/${offload.model} (scored ${offloadTier}, ${offloadRule})`
+            : `model-policy: offload to codex ${offload.model} (effort ${offload.effort}, scored ${offloadTier}, ${offloadRule})`)
           : (redirectTo
             ? `model-policy: ${effectiveTier} via ${redirectTo} (${rule})`
             : `model-policy: ${effectiveTier} (${rule})`),

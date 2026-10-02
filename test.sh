@@ -949,6 +949,99 @@ JS
 assert "explicit model still gets its tier's effort" "fable/medium" \
   "$(MP_LIB="file://$DIR/hooks/lib.mjs" "$NODE" "$SANDBOX/effort-fill.mjs")"
 
+echo
+echo "== Antigravity offload: routing, usage spill and wrapper guards =="
+S_AGY="test-session-agy"
+printf '{"model":"opus","via":"sessionstart","agents":["scout","worker","architect","codex","agy"]}' > "$SESS/$S_AGY.json"
+AGYTAG='"subagent_type":"general-purpose","description":"[agy] review the parser","prompt":"review the parser for correctness"'
+GEMTAG='"subagent_type":"general-purpose","description":"[gemini] review the parser","prompt":"review the parser for correctness"'
+redirect "[agy] swaps the type for the relay" agy "$(agent $S_AGY "$AGYTAG")"
+grepfield "[agy] names the third-party pool" prompt "pool: thirdparty" "$(agent $S_AGY "$AGYTAG")"
+grepfield "[agy] maps sonnet to its model" prompt "model: claude-sonnet-4-6" "$(agent $S_AGY "$AGYTAG")"
+redirect "[gemini] swaps the type for the relay" agy "$(agent $S_AGY "$GEMTAG")"
+grepfield "[gemini] names the Gemini pool" prompt "pool: gemini" "$(agent $S_AGY "$GEMTAG")"
+grepfield "[gemini] maps sonnet to its model" prompt "model: gemini-3.8-flash-medium" "$(agent $S_AGY "$GEMTAG")"
+grepfield "[agy] maps haiku to its model" prompt "model: gpt-oss-120b-medium" "$(agent $S_AGY '"subagent_type":"general-purpose","description":"[agy] find it","prompt":"find the auth config"')"
+grepfield "[gemini] maps haiku to its model" prompt "model: gemini-3.8-flash-low" "$(agent $S_AGY '"subagent_type":"general-purpose","description":"[gemini] find it","prompt":"find the auth config"')"
+grepfield "[agy] maps opus to its model" prompt "model: claude-opus-4-6-thinking" "$(agent $S_AGY '"subagent_type":"general-purpose","description":"[agy] [hard] design it","prompt":"design it"')"
+grepfield "[gemini] maps opus to its model" prompt "model: gemini-3.1-pro-high" "$(agent $S_AGY '"subagent_type":"general-purpose","description":"[gemini] [hard] design it","prompt":"design it"')"
+FABLE_POLICY="$SANDBOX/agy-fable.json"
+"$NODE" -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));p.overrides.hardTier="fable";fs.writeFileSync(process.argv[2],JSON.stringify(p));' "$DIR/policy.json" "$FABLE_POLICY"
+FABLE_OUT="$(printf '%s' "$(agent $S_AGY '"subagent_type":"general-purpose","description":"[agy] [hard] design it","prompt":"design it"')" | env MODEL_POLICY_POLICY="$FABLE_POLICY" sh "$RUN" "$GATE" 2>/dev/null)"
+assert "[agy] maps fable to its model" yes "$(printf '%s' "$FABLE_OUT" | grep -q 'model: claude-opus-4-6-thinking' && echo yes || echo no)"
+redirect "[gpt] wins over both agy tags" codex "$(agent $S_AGY '"subagent_type":"general-purpose","description":"[gpt] [agy] [gemini] review","prompt":"review it"')"
+grepfield "[agy] wins over Gemini" prompt "pool: thirdparty" "$(agent $S_AGY '"subagent_type":"general-purpose","description":"[agy] [gemini] review","prompt":"review it"')"
+redirect "agy leaves specialised built-ins alone" Explore "$(agent $S_AGY '"subagent_type":"Explore","description":"[agy] review","prompt":"find it"')"
+redirect "agy requires its relay at SessionStart" scout "$(agent $SESSION_READY '"subagent_type":"general-purpose","description":"[agy] find","prompt":"find it"')"
+
+# The snapshot and clock are both injected: tests never touch a real install's
+# usage.json and do not depend on wall time.
+USAGE="$SANDBOX/usage.json"
+auto_agent() { # <snapshot-json-or-empty> <description> <prompt>
+  [ -n "$1" ] && printf '%s' "$1" > "$USAGE" || rm -f "$USAGE"
+  printf '%s' "$(agent $S_AGY "\"subagent_type\":\"general-purpose\",\"description\":\"$2\",\"prompt\":\"$3\"")" \
+    | env MODEL_POLICY_USAGE_SNAPSHOT="$USAGE" MODEL_POLICY_NOW=1000 sh "$RUN" "$GATE" 2>/dev/null \
+    | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).hookSpecificOutput.updatedInput.subagent_type)}catch{process.stdout.write("NOOP")}})'
+}
+# `agent` above emits its own JSON only when piped through the gate, so build these
+# payloads directly for the snapshot cases.
+spill() { # <snapshot-json-or-empty> <description> <prompt>
+  [ -n "$1" ] && printf '%s' "$1" > "$USAGE" || rm -f "$USAGE"
+  "$NODE" -e 'process.stdout.write(JSON.stringify({session_id:process.argv[1],tool_use_id:"u",hook_event_name:"PreToolUse",tool_name:"Agent",tool_input:{subagent_type:"general-purpose",description:process.argv[2],prompt:process.argv[3]}}))' "$S_AGY" "$2" "$3" \
+    | env MODEL_POLICY_USAGE_SNAPSHOT="$USAGE" MODEL_POLICY_NOW=1000 sh "$RUN" "$GATE" 2>/dev/null \
+    | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).hookSpecificOutput.updatedInput.subagent_type)}catch{process.stdout.write("NOOP")}})'
+}
+assert "fresh five-hour usage spills sonnet" agy "$(spill '{"five_hour_pct":80,"ts":999}' "review" "review the parser")"
+assert "fresh seven-day usage spills opus" agy "$(spill '{"seven_day_pct":95,"ts":999}' "debug it" "debug the regression")"
+assert "stale usage does not spill" general-purpose "$(spill '{"five_hour_pct":99,"ts":1}' "review" "review the parser")"
+assert "missing usage does not spill" general-purpose "$(spill '' "review" "review the parser")"
+assert "below threshold does not spill" general-purpose "$(spill '{"five_hour_pct":79,"seven_day_pct":94,"ts":999}' "review" "review the parser")"
+assert "explicit Gemini tag beats usage spill" agy "$(spill '{"five_hour_pct":99,"ts":999}' "[gemini] review" "review the parser")"
+printf '%s' "$(agent $S_AGY "$AGYTAG")" | sh "$RUN" "$GATE" >/dev/null 2>&1
+assert "agy ledger records pool and tag route" thirdparty/tag \
+  "$("$NODE" -e 'const l=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n").map(JSON.parse);const r=l.filter(x=>x.offload==="agy").pop();process.stdout.write((r?.offload_pool||"")+"/"+(r?.offload_via||""))' "$LEDG")"
+
+assert "agy preamble strips to the bare task" match \
+  "$("$NODE" --input-type=module -e '
+    import {promptFingerprint, AGY_TASK_MARKER as M} from "'"$DIR"'/hooks/lib.mjs";
+    const p="AGY-OFFLOAD:\n  pool: thirdparty\n  model: claude-sonnet-4-6\n  wrapper: /Some Path/bin/agy-relay.sh\n  cwd: /x/.worktrees/y\n\ninstructions\n\n"+M+"\n\n";
+    process.stdout.write(promptFingerprint(p+"review it")===promptFingerprint("review it")?"match":"MISMATCH");
+  ')"
+
+FAKE_AGY="$SANDBOX/fake-agy"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\\n" "$@" > "${AGY_ARGV_LOG:-/dev/null}"' 'case "$*" in *PERMDENY*) printf "jetski: no output produced\\n" ;; *) printf "AGY-ANSWER\\n" ;; esac' > "$FAKE_AGY"
+chmod +x "$FAKE_AGY"
+AGY_POLICY="$SANDBOX/agy-policy.json"
+"$NODE" -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));p.agy.binary=process.argv[2];fs.writeFileSync(process.argv[3],JSON.stringify(p));' "$DIR/policy.json" "$FAKE_AGY" "$AGY_POLICY"
+AGY_TASK="$SANDBOX/agy-task.md"; printf 'review this\n' > "$AGY_TASK"
+AGY_LOG="$SANDBOX/agy-argv.log"
+agy_wrap() { env MODEL_POLICY_POLICY="$AGY_POLICY" AGY_ARGV_LOG="$AGY_LOG" bash "$DIR/bin/agy-relay.sh" "$@" 2>&1; }
+mkdir -p "$SANDBOX/.worktrees/x"
+rm -f "$AGY_LOG"
+out="$(agy_wrap --task "$AGY_TASK" --pool thirdparty --model not-a-model --access read-only --cwd "$DIR")"
+assert "agy wrapper rejects an unknown model without launch" no "$(test -e "$AGY_LOG" && echo yes || echo no)"
+rm -f "$AGY_LOG"; out="$(agy_wrap --task "$AGY_TASK" --pool gemini --access edit --cwd "$SANDBOX/.worktrees/x")"
+assert "agy wrapper refuses Gemini edits without launch" no "$(test -e "$AGY_LOG" && echo yes || echo no)"
+rm -f "$AGY_LOG"; out="$(agy_wrap --task "$AGY_TASK" --pool thirdparty --access edit --cwd "$SANDBOX")"
+assert "agy wrapper refuses edits outside worktrees" no "$(test -e "$AGY_LOG" && echo yes || echo no)"
+rm -f "$AGY_LOG"; out="$(agy_wrap --task "$AGY_TASK" --pool thirdparty --access read-only --cwd "$DIR" --sandbox nope)"
+assert "agy wrapper refuses forbidden flags" no "$(test -e "$AGY_LOG" && echo yes || echo no)"
+rm -f "$AGY_LOG"; out="$(agy_wrap --task "$AGY_TASK" --pool thirdparty --access read-only --cwd /does/not/exist)"
+assert "agy wrapper refuses missing cwd without launch" no "$(test -e "$AGY_LOG" && echo yes || echo no)"
+out="$(agy_wrap --task "$AGY_TASK" --pool thirdparty --access edit --cwd "$SANDBOX/.worktrees/x")"
+assert "agy edit mode reaches the worker" yes "$(printf '%s' "$out" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).ok?"yes":"no")}catch{process.stdout.write("no")}})')"
+assert "agy edit mode passes accept-edits" yes "$(grep -qx -- '--mode' "$AGY_LOG" && echo yes || echo no)"
+printf 'PERMDENY\n' > "$AGY_TASK"
+out="$(agy_wrap --task "$AGY_TASK" --pool thirdparty --access read-only --cwd "$DIR")"
+assert "agy detects permission-denied output" agy_permission_denied "$(printf '%s' "$out" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).reason||"")}catch{}})')"
+
+SNAP_OUT="$SANDBOX/snapshot.json"
+printf '%s' '{"rate_limits":{"five_hour":{"used_percentage":81}}}' | MODEL_POLICY_USAGE_SNAPSHOT="$SNAP_OUT" bash "$DIR/bin/usage-snapshot.sh"
+assert "usage snapshot helper stays silent" "" "$(printf '%s' '{"rate_limits":{}}' | MODEL_POLICY_USAGE_SNAPSHOT="$SNAP_OUT" bash "$DIR/bin/usage-snapshot.sh")"
+assert "usage snapshot helper writes rate-limit data" 81 \
+  "$("$NODE" -e 'const p=require(process.argv[1]);process.stdout.write(String(p.five_hour_pct))' "$SNAP_OUT" 2>/dev/null)"
+
+rm -f "$SESS/$S_AGY.json" "$SESS/$S_AGY.events"
 rm -f "$SESS/$S_CX.json" "$SESS/$S_CX.events"
 rm -f "$SESS/$SESSION_OK.json" "$SESS/$SESSION_READY.json" "$SESS/$SESSION_LEGACY.json"
 echo

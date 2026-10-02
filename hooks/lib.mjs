@@ -24,6 +24,7 @@ export const POLICY_PATH = process.env.MODEL_POLICY_POLICY || join(ROOT, 'policy
 // routine `bash test.sh`.
 export const LEDGER_PATH = process.env.MODEL_POLICY_LEDGER || join(ROOT, 'ledger.jsonl');
 export const SESSIONS_DIR = process.env.MODEL_POLICY_SESSIONS || join(ROOT, 'sessions');
+export const USAGE_SNAPSHOT_PATH = process.env.MODEL_POLICY_USAGE_SNAPSHOT || join(ROOT, 'usage.json');
 
 const DEFAULT_TIER_ORDER = ['haiku', 'sonnet', 'opus', 'fable'];
 
@@ -264,6 +265,37 @@ export function resolveTier(toolInput, policy, sessionTier) {
  * fingerprint stripper so the two can never drift apart.
  */
 export const CODEX_TASK_MARKER = '--- CODEX-TASK-BEGINS (send only what follows) ---';
+export const AGY_TASK_MARKER = '--- AGY-TASK-BEGINS (send only what follows) ---';
+
+/** Read a fresh status-line usage snapshot, or null when it cannot safely spill. */
+export function usageSnapshot(policy) {
+  try {
+    const spill = policy?.agy?.usageSpill || {};
+    if (spill.enabled !== true) return null;
+    const snap = JSON.parse(readFileSync(USAGE_SNAPSHOT_PATH, 'utf8'));
+    const now = Number(process.env.MODEL_POLICY_NOW || Math.floor(Date.now() / 1000));
+    if (!Number.isFinite(now) || !Number.isFinite(snap?.ts)
+      || snap.ts > now || now - snap.ts > (spill.maxAgeSec ?? 600)) return null;
+    const five = Number(snap.five_hour_pct);
+    const seven = Number(snap.seven_day_pct);
+    const overFive = Number.isFinite(five) && five >= Number(spill.fiveHourPct ?? Infinity);
+    const overSeven = Number.isFinite(seven) && seven >= Number(spill.sevenDayPct ?? Infinity);
+    return overFive || overSeven ? snap : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The explicit tag named by a description, in the fixed backend precedence order. */
+export function offloadTag(desc, policy) {
+  const text = String(desc ?? '');
+  const cx = policy?.overrides?.codexTag || '[gpt]';
+  const pools = policy?.agy?.pools || {};
+  if (text.includes(cx)) return 'codex';
+  if (text.includes(pools.thirdparty?.tag || '[agy]')) return 'agy:thirdparty';
+  if (text.includes(pools.gemini?.tag || '[gemini]')) return 'agy:gemini';
+  return null;
+}
 
 export function resolveCodexOffload(toolInput, policy, tier, currentType, record) {
   const cx = policy.codex || {};
@@ -290,10 +322,7 @@ export function resolveCodexOffload(toolInput, policy, tier, currentType, record
   const types = Array.isArray(cx.offloadableTypes) ? cx.offloadableTypes : [];
   if (!direct && !types.includes(String(currentType ?? ''))) return null;
 
-  const desc = String(toolInput?.description ?? '');
-  const tagged = typeof cx.tagFrom === 'string'
-    ? desc.includes(cx.tagFrom)
-    : desc.includes(policy.overrides?.codexTag || '[gpt]');
+  const tagged = offloadTag(toolInput?.description, policy) === 'codex';
 
   const never = Array.isArray(cx.neverAutoTiers) ? cx.neverAutoTiers : [];
   const auto = Array.isArray(cx.autoTiers) ? cx.autoTiers : [];
@@ -348,6 +377,60 @@ export function resolveCodexOffload(toolInput, policy, tier, currentType, record
     preamble,
     via: direct ? 'direct' : (tagged ? 'tag' : `auto:${tier}`),
   };
+}
+
+/** Resolve an Antigravity offload after the shared task tier has been scored. */
+export function resolveAgyOffload(toolInput, policy, tier, currentType, record, cwd) {
+  const agy = policy.agy || {};
+  if (agy.enabled !== true) return null;
+  const agent = typeof agy.agent === 'string' && agy.agent.length > 0 ? agy.agent : null;
+  if (!agent) return null;
+  const loaded = record?.via === 'sessionstart' && Array.isArray(record.agents);
+  if (!loaded || !record.agents.includes(agent)) return null;
+
+  const direct = String(currentType ?? '') === agent;
+  const types = Array.isArray(agy.offloadableTypes) ? agy.offloadableTypes : [];
+  if (!direct && !types.includes(String(currentType ?? ''))) return null;
+
+  const tagged = offloadTag(toolInput?.description, policy);
+  let poolName = tagged?.startsWith('agy:') ? tagged.slice(4) : null;
+  let via = poolName ? 'tag' : null;
+  if (!poolName && direct) {
+    poolName = 'thirdparty';
+    via = 'direct';
+  }
+  if (!poolName && !tagged) {
+    const spill = agy.usageSpill || {};
+    const allowed = Array.isArray(spill.tiers) ? spill.tiers : [];
+    if (allowed.includes(tier) && usageSnapshot(policy)) {
+      poolName = spill.pool;
+      via = 'auto:usage';
+    }
+  }
+  if (!poolName) return null;
+
+  const pool = (agy.pools || {})[poolName];
+  if (!pool || typeof pool !== 'object') return null;
+  const model = pool.byTier?.[tier];
+  if (typeof model !== 'string' || !model) return null;
+  const relayTier = availableTier(agy.relayTier || 'haiku', policy).tier;
+  const wrapper = join(ROOT, 'bin', 'agy-relay.sh');
+  const parentCwd = typeof cwd === 'string' && cwd ? cwd : process.cwd();
+  const preamble = [
+    'AGY-OFFLOAD:',
+    `  pool: ${poolName}`,
+    `  model: ${model}`,
+    `  wrapper: ${wrapper}`,
+    `  cwd: ${parentCwd}`,
+    '',
+    'These lines are for you, the relay. Run the wrapper with exactly those settings',
+    'and relay its answer verbatim. Do not attempt the task yourself, and do NOT',
+    'include any line up to and including the marker below in what you send.',
+    '',
+    AGY_TASK_MARKER,
+    '',
+  ].join('\n');
+  return { agent, pool: poolName, model, relayTier, preamble, via };
 }
 
 /**
@@ -663,7 +746,7 @@ export function promptFingerprint(text) {
 }
 
 /**
- * Drop a CODEX-OFFLOAD preamble so a fingerprint describes the TASK.
+ * Drop an offload preamble so a fingerprint describes the TASK.
  *
  * The preamble runs well past 100 characters, and a fingerprint keeps only the
  * first 100 — so without this, every offloaded spawn sharing a model and effort
@@ -695,13 +778,16 @@ export function stripOffloadPreamble(text) {
   // space ("/Users/Matt Smith/...") failed to match, and the envelope then went
   // UNSTRIPPED — putting routing metadata back into every fingerprint, the exact
   // bug the anchor was added to fix.
-  const ENVELOPE = /^CODEX-OFFLOAD:\n {2}model: \S+\n {2}effort: \S+\n {2}wrapper: .+\n/;
-  if (!ENVELOPE.test(text)) return text;
+  const CODEX_ENVELOPE = /^CODEX-OFFLOAD:\n {2}model: \S+\n {2}effort: \S+\n {2}wrapper: .+\n/;
+  const AGY_ENVELOPE = /^AGY-OFFLOAD:\n {2}pool: (gemini|thirdparty)\n {2}model: \S+\n {2}wrapper: .+\n {2}cwd: .+\n/;
+  const marker = CODEX_ENVELOPE.test(text) ? CODEX_TASK_MARKER
+    : (AGY_ENVELOPE.test(text) ? AGY_TASK_MARKER : null);
+  if (!marker) return text;
   // The marker must be a LINE of its own, not merely present somewhere: an
   // `indexOf` hit inside a sentence was enough to trigger a split.
-  const m = text.match(new RegExp('^' + CODEX_TASK_MARKER.replace(/[.*+?^${}()|[\]\\-]/g, '\\$&') + '$', 'm'));
+  const m = text.match(new RegExp('^' + marker.replace(/[.*+?^${}()|[\]\\-]/g, '\\$&') + '$', 'm'));
   if (!m || m.index === undefined) return text;
-  return text.slice(m.index + CODEX_TASK_MARKER.length);
+  return text.slice(m.index + marker.length);
 
   // Honest limit: this recognises the SHAPE the gate emits, so a caller who
   // reproduces those exact bytes is indistinguishable from a real envelope.

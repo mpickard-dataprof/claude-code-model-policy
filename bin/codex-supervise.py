@@ -80,8 +80,35 @@ def group_members(pgid):
 
 
 def main():
-    (timeout_s, out_path, err_path, stdout_path, task_path,
-     sandbox, model, effort, cwd) = sys.argv[1:10]
+    # The legacy positional form is deliberately unchanged for Codex. The
+    # command form lets another wrapper reuse this process-group owner without
+    # copying its deadline and teardown logic.
+    generic = len(sys.argv) > 1 and sys.argv[1] == "--command"
+    if generic:
+        try:
+            cut = sys.argv.index("--", 2)
+            (timeout_s, out_path, err_path, stdout_path, task_path,
+             model, cwd) = sys.argv[2:cut]
+            argv = sys.argv[cut + 1:]
+        except Exception:
+            emit(reason="invalid generic supervisor arguments", exit_code=2)
+            return 2
+        sandbox = None
+        effort = None
+        worker_name = os.path.basename(argv[0]) if argv else "worker"
+        if not argv:
+            emit(reason="no worker command given", exit_code=2, model=model)
+            return 2
+    else:
+        (timeout_s, out_path, err_path, stdout_path, task_path,
+         sandbox, model, effort, cwd) = sys.argv[1:10]
+        argv = [
+            "codex", "exec", "--skip-git-repo-check",
+            "-C", cwd, "-s", sandbox, "-m", model,
+            "-c", "model_reasoning_effort=%s" % effort,
+            "-o", out_path, "-",
+        ]
+        worker_name = "codex"
     timeout_s = int(timeout_s)
     started = time.time()
 
@@ -102,13 +129,6 @@ def main():
         except Exception:
             pass
 
-    argv = [
-        "codex", "exec", "--skip-git-repo-check",
-        "-C", cwd, "-s", sandbox, "-m", model,
-        "-c", "model_reasoning_effort=%s" % effort,
-        "-o", out_path, "-",
-    ]
-
     try:
         fin = open(task_path, "rb")
         fout = open(stdout_path, "wb")
@@ -120,13 +140,14 @@ def main():
 
     try:
         proc = subprocess.Popen(argv, stdin=fin, stdout=fout, stderr=ferr,
-                                start_new_session=True)
+                                start_new_session=True, cwd=(cwd if generic else None))
     except FileNotFoundError:
-        emit(reason="codex CLI not found on PATH", exit_code=2,
+        emit(reason=("%s CLI not found" % worker_name) if generic
+             else "codex CLI not found on PATH", exit_code=2,
              model=model, effort=effort, sandbox=sandbox)
         return 2
     except Exception as exc:
-        emit(reason="could not start codex: %s" % exc, exit_code=2,
+        emit(reason="could not start %s: %s" % (worker_name, exc), exit_code=2,
              model=model, effort=effort, sandbox=sandbox)
         return 2
 
@@ -233,9 +254,9 @@ def main():
     elif code is None:
         ok, reason = False, "worker did not exit and could not be reaped"
     elif code != 0:
-        ok, reason = False, "codex exited %d" % code
+        ok, reason = False, "%s exited %d" % (worker_name, code)
     elif nbytes == 0:
-        ok, reason = False, "codex produced no output"
+        ok, reason = False, "%s produced no output" % worker_name
     else:
         ok, reason = True, None
 

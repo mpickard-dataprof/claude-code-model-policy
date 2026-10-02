@@ -56,6 +56,29 @@ function codexBrief(policy) {
   ];
 }
 
+function agyBrief(policy) {
+  const agy = policy.agy || {};
+  if (agy.enabled !== true || !agy.agent || !availableAgents().includes(agy.agent)) return [];
+  const pools = agy.pools || {};
+  const gemini = pools.gemini?.tag || '[gemini]';
+  const thirdparty = pools.thirdparty?.tag || '[agy]';
+  const spill = agy.usageSpill || {};
+  return [
+    '## Offloading to Antigravity models',
+    '',
+    `Tag a review with \`${gemini}\` to use Gemini. It is **reviews only** and always`,
+    'read-only. Tag a review or a self-contained worktree development task with',
+    `\`${thirdparty}\` to use the third-party pool. Development can edit only a named`,
+    '`.worktrees/` directory and has no shell, so run tests yourself afterwards.',
+    '',
+    `If more than one offload tag appears, precedence is \`${policy.overrides?.codexTag || '[gpt]'}\` > \`${thirdparty}\` > \`${gemini}\`.`,
+    spill.enabled === true
+      ? `When the local usage snapshot is fresh and either usage window is high, untagged ${Array.isArray(spill.tiers) ? spill.tiers.join('/') : 'sonnet/opus'} work spills to the ${spill.pool || 'thirdparty'} pool automatically.`
+      : 'Usage-window auto-spill is disabled; these tags are the only route in.',
+    '',
+  ];
+}
+
 async function main() {
   const input = parseJson(await readStdin());
   if (!input) return;
@@ -104,6 +127,7 @@ async function main() {
     'path available, and generic spawns that score mechanical are redirected to it anyway.',
     '',
     ...codexBrief(policy),
+    ...agyBrief(policy),
     '## Workflow scripts ARE auto-tiered — but say so when you know better',
     '',
     'An inline Workflow script is rewritten before it runs: every `agent()` call that',
