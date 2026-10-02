@@ -45,7 +45,10 @@ async function main() {
     if (typeof relay !== 'string' || input.agent_type !== relay) return;
     const wrapper = join(ROOT, 'bin', 'agy-relay.sh').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const command = typeof toolInput.command === 'string' ? toolInput.command : '';
-    if (tool === 'Bash' && new RegExp(`^bash ${wrapper} --grant [a-f0-9]{48}$`).test(command)) return;
+    // `(?![\\s\\S])` is an absolute end-of-string assertion.  JavaScript's `$`
+    // also matches immediately before a trailing newline, which made
+    // `bash ... --grant <id>\n<another command>` look like the exact command.
+    if (tool === 'Bash' && new RegExp(`^bash ${wrapper} --grant [a-f0-9]{48}(?![\\s\\S])`).test(command)) return;
     emit({
       hookSpecificOutput: {
         hookEventName: 'PreToolUse', permissionDecision: 'deny',
