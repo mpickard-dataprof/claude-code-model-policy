@@ -228,8 +228,13 @@ if [ -d "$GEMINI" ]; then
     [ -e "$AGY_STATE/$p" ] && ARGS+=(--bind "$AGY_STATE/$p" "$AGY_STATE/$p")
   done
 fi
-# The configured executable may itself live under $HOME.
+# agy rewrites bin/agentapi (a shim that execs the agy binary by its real path)
+# before every shell command. The host copy must stay readonly - an unsandboxed
+# agy would later run whatever a box wrote there - so each run gets a private,
+# throwaway bin/ and the binary is also visible readonly at its real path.
+[ -d "$AGY_STATE/bin" ] && ARGS+=(--tmpfs "$AGY_STATE/bin")
 ARGS+=(--ro-bind "$BINARY" /agy)
+ensure_box_parents "$BINARY"; ARGS+=(--ro-bind "$BINARY" "$BINARY")
 # /relay contains task input only. Worker stdout is captured through the
 # supervisor's already-open host FD, so a worker cannot replace answer.md with
 # a symlink that the host later reopens by name.
