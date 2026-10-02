@@ -437,6 +437,9 @@ for p in changed:
 # otherwise hide the very marker the copy-side check looks for.
 for p in changed:
  if any(x.lower().endswith('.git') for x in p.split('/')[:-1]): reject('git_repo',p)
+ # Paths inside an existing nested repo (its own .git, file or dir) are off limits.
+ parts=p.split('/')[:-1]
+ if any(os.path.lexists(os.path.join(cwd,*parts[:i],'.git')) for i in range(1,len(parts)+1)): reject('git_repo',p)
  for top in (copy,cwd):
   d=os.path.join(top,os.path.dirname(p))
   while os.path.isdir(d):

@@ -1297,6 +1297,10 @@ assert "deleting inside an existing bare repo is rejected" "edit_rejected:git_re
 G_BARE_HEAD="$(printf '%048x' 5014)"; grant "$G_BARE_HEAD" thirdparty claude-sonnet-4-6 edit "$WT_BARE_DEL" 'bare head delete'
 out="$(AGY_EDIT_ACTION='rm vendor/r/HEAD' agy_wrap --grant "$G_BARE_HEAD")"
 assert "deleting a bare repo's HEAD marker is rejected" "edit_rejected:git_repo:vendor/r/HEAD|$bare_before" "$(json_reason "$out")|$(tree_hash "$WT_BARE_DEL")"
+WT_NESTED="$(edit_wt nested-repo)"; mkdir -p "$WT_NESTED/sub"; printf x > "$WT_NESTED/sub/file.txt"; git -C "$WT_NESTED" add . && git -C "$WT_NESTED" commit -qm sub; git init -q "$WT_NESTED/sub"
+nested_before="$(tree_hash "$WT_NESTED")"; G_NESTED="$(printf '%048x' 5015)"; grant "$G_NESTED" thirdparty claude-sonnet-4-6 edit "$WT_NESTED" 'nested repo edit'
+out="$(AGY_EDIT_ACTION='printf changed > sub/file.txt' agy_wrap --grant "$G_NESTED")"
+assert "editing inside an existing nested repo is rejected" "edit_rejected:git_repo:sub/file.txt|$nested_before" "$(json_reason "$out")|$(tree_hash "$WT_NESTED")"
 assert "git in the box ignores system git config" yes "$(grep -A1 -x -- '--setenv' "$BWRAP_LOG" | grep -qx GIT_CONFIG_NOSYSTEM && echo yes || echo no)"
 WT_CONFLICT="$(edit_wt reject-conflict)"; G_CONFLICT=abababababababababababababababababababababababab
 grant "$G_CONFLICT" thirdparty claude-sonnet-4-6 edit "$WT_CONFLICT" 'conflict'
