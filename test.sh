@@ -1289,6 +1289,15 @@ assert "edit rejection identifies its rule and offending path" yes "$(printf '%s
 WT_CI="$(edit_wt reject-ci-names)"; before="$(tree_hash "$WT_CI")"; G_CI="$(printf '%048x' 4988)"; grant "$G_CI" thirdparty claude-sonnet-4-6 edit "$WT_CI" 'CI config names'
 out="$(AGY_EDIT_ACTION='printf x > Jenkinsfile; printf x > azure-pipelines.yml' agy_wrap --grant "$G_CI")"
 assert "known CI config names are rejected atomically" yes "$(if [[ "$(json_reason "$out")" == edit_rejected:path:* ]] && [ "$before" = "$(tree_hash "$WT_CI")" ]; then echo yes; else echo no; fi)"
+# Round 7: a pre-existing (tracked) bare repo may not be edited, even by deletion.
+WT_BARE_DEL="$(edit_wt bare-delete)"; mkdir -p "$WT_BARE_DEL/vendor/r/objects" "$WT_BARE_DEL/vendor/r/refs"; printf 'ref: refs/heads/main\n' > "$WT_BARE_DEL/vendor/r/HEAD"; printf x > "$WT_BARE_DEL/vendor/r/config"; printf x > "$WT_BARE_DEL/vendor/r/objects/keep"; printf x > "$WT_BARE_DEL/vendor/r/refs/keep"; git -C "$WT_BARE_DEL" add . && git -C "$WT_BARE_DEL" commit -qm bare
+bare_before="$(tree_hash "$WT_BARE_DEL")"; G_BARE_DEL="$(printf '%048x' 5013)"; grant "$G_BARE_DEL" thirdparty claude-sonnet-4-6 edit "$WT_BARE_DEL" 'bare delete'
+out="$(AGY_EDIT_ACTION='rm vendor/r/config' agy_wrap --grant "$G_BARE_DEL")"
+assert "deleting inside an existing bare repo is rejected" "edit_rejected:git_repo:vendor/r/config|$bare_before" "$(json_reason "$out")|$(tree_hash "$WT_BARE_DEL")"
+G_BARE_HEAD="$(printf '%048x' 5014)"; grant "$G_BARE_HEAD" thirdparty claude-sonnet-4-6 edit "$WT_BARE_DEL" 'bare head delete'
+out="$(AGY_EDIT_ACTION='rm vendor/r/HEAD' agy_wrap --grant "$G_BARE_HEAD")"
+assert "deleting a bare repo's HEAD marker is rejected" "edit_rejected:git_repo:vendor/r/HEAD|$bare_before" "$(json_reason "$out")|$(tree_hash "$WT_BARE_DEL")"
+assert "git in the box ignores system git config" yes "$(grep -A1 -x -- '--setenv' "$BWRAP_LOG" | grep -qx GIT_CONFIG_NOSYSTEM && echo yes || echo no)"
 WT_CONFLICT="$(edit_wt reject-conflict)"; G_CONFLICT=abababababababababababababababababababababababab
 grant "$G_CONFLICT" thirdparty claude-sonnet-4-6 edit "$WT_CONFLICT" 'conflict'
 out="$(AGY_EDIT_ACTION="printf copy > base.txt; printf host > '$WT_CONFLICT/base.txt'" agy_wrap --grant "$G_CONFLICT")"
@@ -1345,11 +1354,14 @@ git -C "$GIT_MAIN" worktree add -q "$GIT_WT" -b agy-test-worktree
 GIT_COMMON="$(git -C "$GIT_WT" rev-parse --path-format=absolute --git-common-dir)"
 GIT_WT_DIR="$(git -C "$GIT_WT" rev-parse --absolute-git-dir)"
 git -C "$GIT_MAIN" config remote.origin.url https://user:SECRETTOKEN@example.invalid/r.git
+# Values that smuggle a URL through allow-listed-looking keys (round 7).
+git -C "$GIT_MAIN" config branch.main.remote https://user:SECRETTOKEN@example.invalid/r.git; git -C "$GIT_MAIN" config extensions.partialclone https://user:SECRETTOKEN@example.invalid/r.git
 printf 'SECRETTOKEN\n' > "$GIT_COMMON/FETCH_HEAD"
 printf '[remote "origin"]\n\turl = https://user:SECRETTOKEN@example.invalid/r.git\n' > "$GIT_COMMON/config.worktree"
 printf '[remote "origin"]\n\turl = https://user:SECRETTOKEN@example.invalid/r.git\n' > "$GIT_WT_DIR/config.worktree"
 GIT_NORMAL="$SANDBOX/agy-git-normal"; git init -q "$GIT_NORMAL"; git -C "$GIT_NORMAL" config user.email test@example.invalid; git -C "$GIT_NORMAL" config user.name test; printf normal > "$GIT_NORMAL/normal.txt"; git -C "$GIT_NORMAL" add normal.txt && git -C "$GIT_NORMAL" commit -qm initial
 git -C "$GIT_NORMAL" config remote.origin.url https://user:SECRETTOKEN@example.invalid/r.git
+git -C "$GIT_NORMAL" config branch.main.remote https://user:SECRETTOKEN@example.invalid/r.git
 printf 'SECRETTOKEN\n' > "$GIT_NORMAL/.git/FETCH_HEAD"
 git_metadata_overlays_safe() { "$NODE" -e 'const fs=require("fs"),a=fs.readFileSync(process.argv[1],"utf8").trim().split("\n"),targets=process.argv.slice(2);let ok=true;for(const t of targets){const i=a.findIndex((x,j)=>x==="--ro-bind"&&a[j+2]===t);if(i<0){ok=false;continue}const s=fs.readFileSync(a[i+1],"utf8");if(s.includes("SECRETTOKEN"))ok=false;if(t.endsWith("/config")&&!s.includes("repositoryformatversion"))ok=false}process.stdout.write(ok?"yes":"no")' "$BWRAP_LOG" "$@"; }
 G_NORMAL_META="$(printf '%048x' 4010)"; grant "$G_NORMAL_META" thirdparty claude-sonnet-4-6 read-only "$GIT_NORMAL" 'normal git metadata'
@@ -1392,8 +1404,8 @@ assert "read-only grant has no writable checkout bind" yes \
   "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n");process.stdout.write(a.some((x,i)=>x==="--bind"&&a[i+2]==="/workspace")?"no":"yes")' "$BWRAP_LOG")"
 assert "bwrap never mounts /run and isolates IPC/process/session/UTS" yes \
   "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n"),opts=["--unshare-ipc","--unshare-pid","--new-session","--unshare-uts","--clearenv"];const run=a.some((x,i)=>(x==="--bind"||x==="--ro-bind")&&a[i+1]==="/run"&&a[i+2]==="/run");process.stdout.write(!run&&opts.every(x=>a.includes(x))?"yes":"no")' "$BWRAP_LOG")"
-assert "bwrap keeps only the five approved environment variables" yes \
-  "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n"),got=[];for(let i=0;i<a.length;i++)if(a[i]==="--setenv")got.push(a[i+1]);process.stdout.write(a.includes("--clearenv")&&got.sort().join(",")==="HOME,LANG,PATH,TERM,TZ"?"yes":"no")' "$BWRAP_LOG")"
+assert "bwrap keeps only the six approved environment variables" yes \
+  "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n"),got=[];for(let i=0;i<a.length;i++)if(a[i]==="--setenv")got.push(a[i+1]);process.stdout.write(a.includes("--clearenv")&&got.sort().join(",")==="GIT_CONFIG_NOSYSTEM,HOME,LANG,PATH,TERM,TZ"?"yes":"no")' "$BWRAP_LOG")"
 RESOLV_TARGET_TEST="$(realpath /etc/resolv.conf 2>/dev/null || true)"
 if [ -n "$RESOLV_TARGET_TEST" ] && [ -f "$RESOLV_TARGET_TEST" ]; then
   assert "DNS exposes only resolved resolv.conf file" yes \

@@ -215,17 +215,20 @@ fi
 # allowlisted config and empty FETCH_HEAD files into the box.
 SANITIZED_GIT_DIR="$OUTDIR/git-sanitized"; mkdir -p "$SANITIZED_GIT_DIR" || fail could_not_create_output_dir
 sanitize_git_config() { python3 - "$1" "$2" <<'PY'
-import os,subprocess,sys
+import os,re,subprocess,sys
 src,dst=sys.argv[1:]
 open(dst,'w').close()
 if not os.path.isfile(src): raise SystemExit
-pattern=r'^(core\.(repositoryformatversion|bare|filemode|logallrefupdates|ignorecase|precomposeunicode|symlinks)|extensions\..*|branch\..*\.(remote|merge))$'
+# Keys AND values are allow-listed: a branch remote or an unknown extension can
+# hold a credential-bearing URL, so neither is copied.
+pattern=r'^(core\.(repositoryformatversion|bare|filemode|logallrefupdates|ignorecase|precomposeunicode|symlinks)|extensions\.(worktreeconfig|objectformat|refstorage))$'
 p=subprocess.run(['git','config','-f',src,'--null','--get-regexp',pattern],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
 if p.returncode not in (0,1): raise SystemExit(1)
 for record in p.stdout.split(b'\0'):
  if not record: continue
  try: key,value=record.decode('utf-8','surrogateescape').split('\n',1)
  except ValueError: raise SystemExit(1)
+ if not re.fullmatch(r'[A-Za-z0-9_.-]{1,64}',value): continue
  subprocess.run(['git','config','-f',dst,'--add',key,value],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
 PY
 }
@@ -239,6 +242,9 @@ ARGS=(--tmpfs / --dir /workspace --symlink usr/bin /bin --symlink usr/lib /lib -
 # commonly an absolute symlink into /run, so expose only that resolved file at
 # both the target path and /etc/resolv.conf, never the containing directory.
 for p in /usr /etc /opt; do [ -e "$p" ] && ARGS+=(--ro-bind "$p" "$p"); done
+# System git config can carry credentials (http.extraHeader, URLs): blank it, and
+# GIT_CONFIG_NOSYSTEM below stops git reading any build-specific system path.
+[ -f /etc/gitconfig ] && ARGS+=(--ro-bind /dev/null /etc/gitconfig)
 RESOLV_TARGET="$(realpath /etc/resolv.conf 2>/dev/null || true)"
 if [ -n "$RESOLV_TARGET" ] && [ -f "$RESOLV_TARGET" ]; then
   ensure_resolv_parents() {
@@ -337,7 +343,7 @@ ensure_box_parents "$BINARY"; ARGS+=(--ro-bind "$BINARY" "$BINARY")
 # a symlink that the host later reopens by name.
 ARGS+=(--dir /relay --ro-bind "$TASK_COPY" /relay/task.md)
 ARGS+=(--unshare-ipc --unshare-pid --new-session --unshare-uts --clearenv)
-ARGS+=(--setenv HOME "$HOME" --setenv PATH "${PATH:-/usr/bin:/bin}" --setenv LANG "${LANG:-C.UTF-8}" --setenv TERM "${TERM:-dumb}" --setenv TZ "${TZ:-UTC}")
+ARGS+=(--setenv GIT_CONFIG_NOSYSTEM 1 --setenv HOME "$HOME" --setenv PATH "${PATH:-/usr/bin:/bin}" --setenv LANG "${LANG:-C.UTF-8}" --setenv TERM "${TERM:-dumb}" --setenv TZ "${TZ:-UTC}")
 ARGS+=(--dev /dev --proc /proc --die-with-parent --chdir /workspace --)
 # git keeps a worktree's history in the main repo's common dir; models read it
 # directly, and agy needs it in the workspace or the read is auto-denied headless.
@@ -427,13 +433,16 @@ for p in changed:
 # Git treats any directory holding HEAD + objects/ + refs/ as a bare repository
 # and obeys its config (core.fsmonitor, hooks) when run inside it, whatever the
 # name. Reject a delta that names or completes such a directory.
-for p in added+modified:
+# Deletions count too, checked in the host tree as well: deleting HEAD would
+# otherwise hide the very marker the copy-side check looks for.
+for p in changed:
  if any(x.lower().endswith('.git') for x in p.split('/')[:-1]): reject('git_repo',p)
- d=os.path.join(copy,os.path.dirname(p))
- while True:
-  if os.path.isfile(os.path.join(d,'HEAD')) and os.path.isdir(os.path.join(d,'objects')) and os.path.isdir(os.path.join(d,'refs')): reject('git_repo',p)
-  if os.path.samefile(d,copy): break
-  d=os.path.dirname(d)
+ for top in (copy,cwd):
+  d=os.path.join(top,os.path.dirname(p))
+  while os.path.isdir(d):
+   if os.path.isfile(os.path.join(d,'HEAD')) and os.path.isdir(os.path.join(d,'objects')) and os.path.isdir(os.path.join(d,'refs')): reject('git_repo',p)
+   if os.path.samefile(d,top): break
+   d=os.path.dirname(d)
 for p in added+modified:
  x=current[p]
  if not x['regular'] or x['nlink'] != 1: reject('non_regular',p)
@@ -576,12 +585,14 @@ else:
 rollback_errors=[]
 for item in reversed(journal):
  try:
-  if not item['backup_moved'] and not item['applied']: continue
+  # A signal can land between a rename and its journal flag, so decide from
+  # what is on disk: a backup that exists is always put back.
+  if not os.path.lexists(item['backup'] or '') and not (item['kind']=='added' and os.path.lexists(item['target']) and not os.path.lexists(item['stage'])): continue
   if fail_rollback and not rollback_fault_used:
    rollback_fault_used=True; raise RuntimeError('injected rollback failure')
   if item['kind']=='added':
-   if os.path.lexists(item['target']): os.unlink(item['target'])
-  elif item['backup_moved'] and os.path.lexists(item['backup']):
+   if os.path.lexists(item['target']) and not os.path.lexists(item['stage']): os.unlink(item['target'])
+  elif os.path.lexists(item['backup']):
    os.rename(item['backup'],item['target'])
  except Exception:
   rollback_errors.append(item['path'])
@@ -605,7 +616,7 @@ def state(p):
  return 'unknown'
 leftovers=stage_leftovers[:]
 for item in journal:
- if item['backup_moved'] and os.path.lexists(item['backup']): leftovers.append(relpath(item['backup']))
+ if item['backup'] and os.path.lexists(item['backup']): leftovers.append(relpath(item['backup']))
 states={p:state(p) for p in changed}
 if rollback_errors or leftovers or any(v!='restored' for v in states.values()):
  print(json.dumps({'ok':False,'reason':'edit_partial','partial':{'applied':[p for p in changed if states[p]=='applied'],'restored':[p for p in changed if states[p]=='restored'],'unknown':[p for p in changed if states[p]=='unknown'],'leftovers':leftovers}})); raise SystemExit
