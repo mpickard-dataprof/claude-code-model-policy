@@ -85,7 +85,7 @@ OUT="$OUTDIR/answer.md"; ERR="$OUTDIR/stderr.log"; PROMPT_FILE="$OUTDIR/prompt.t
 # agy needs a read_file grant for anything outside its workspace, which headless
 # mode auto-denies, so the task is copied into OUTDIR and OUTDIR joins the workspace.
 TASK_COPY="$OUTDIR/task.md"; cp "$TASK" "$TASK_COPY" || fail could_not_copy_task
-PROMPT="You are a headless delegated subagent. You are already in the project directory; list and read files with your file tools. Do not use find (it is not allowed and aborts the run). Read the task file at $TASK_COPY with your file-viewing tool; prefer that tool over a shell. If you use the shell, use only single simple allowed commands (chains only when every command is allowed). Writes outside the permitted directory are blocked by an OS sandbox and will fail. Report failures honestly; never claim a write or command succeeded without its output."
+PROMPT="You are a headless delegated subagent. You are already in the project directory; list and read files with your file tools. Do not use find (it is not allowed and aborts the run). Never run tests, builds, installers or scripts: the caller runs them, and any command outside the allowed read-only list aborts your whole run and discards your reply. Read the task file at $TASK_COPY with your file-viewing tool; prefer that tool over a shell. If you use the shell, use only single simple allowed commands (chains only when every command is allowed). Writes outside the permitted directory are blocked by an OS sandbox and will fail. Report failures honestly; never claim a write or command succeeded without its output."
 printf '%s\n' "$PROMPT" > "$PROMPT_FILE"
 
 # Broad read-only root first, then make $HOME default-deny.  Every permitted
@@ -132,6 +132,8 @@ try:
  if os.path.getsize(out)==0 and any(x.startswith('jetski: no output produced') for x in stderr.splitlines()):
   m=re.search(r'"([a-z_]+)" permission',stderr)
   result['ok']=False; result['reason']='agy_permission_denied:'+(m.group(1) if m else 'unknown')
+  # An edit run can be cut off after it has already changed files.
+  if access=='edit': result['edits_may_exist']=True; result['check']='git -C %s status --short' % cwd
 except Exception: pass
 result.update({'pool':pool,'model':model,'access':access,'cwd':cwd}); result.pop('effort',None); result.pop('sandbox',None)
 print(json.dumps(result)); sys.exit(0 if result.get('ok') else 1)
