@@ -67,7 +67,10 @@ OUTBASE="${MODEL_POLICY_AGY_OUTBASE:-${TMPDIR:-/tmp}}"
 OUTDIR="$(mktemp -d "$OUTBASE/agy-relay.XXXXXX")" || fail could_not_create_output_dir
 PRIVTMP="$(mktemp -d "$OUTBASE/agy-private.XXXXXX")" || fail could_not_create_private_tmp
 OUT="$OUTDIR/answer.md"; ERR="$OUTDIR/stderr.log"; PROMPT_FILE="$OUTDIR/prompt.txt"
-PROMPT="You are a headless delegated subagent. Read the task file at $TASK with your file-viewing tool; prefer that tool over a shell. If you use the shell, use only single simple allowed commands (chains only when every command is allowed). Writes outside the permitted directory are blocked by an OS sandbox and will fail. Report failures honestly; never claim a write or command succeeded without its output."
+# agy needs a read_file grant for anything outside its workspace, which headless
+# mode auto-denies, so the task is copied into OUTDIR and OUTDIR joins the workspace.
+TASK_COPY="$OUTDIR/task.md"; cp "$TASK" "$TASK_COPY" || fail could_not_copy_task
+PROMPT="You are a headless delegated subagent. Read the task file at $TASK_COPY with your file-viewing tool; prefer that tool over a shell. If you use the shell, use only single simple allowed commands (chains only when every command is allowed). Writes outside the permitted directory are blocked by an OS sandbox and will fail. Report failures honestly; never claim a write or command succeeded without its output."
 printf '%s\n' "$PROMPT" > "$PROMPT_FILE"
 
 # Broad read-only root first. Later mounts deliberately overlay it; /tmp is before
@@ -89,22 +92,24 @@ except Exception: pass
 PY
 )
 for d in "$HOME"/.claude*; do [ -f "$d/.credentials.json" ] && ARGS+=(--ro-bind /dev/null "$d/.credentials.json"); done
-ARGS+=(--bind "$PRIVTMP" /tmp --ro-bind "$TASK" "$TASK" --bind "$OUTDIR" "$OUTDIR")
+ARGS+=(--bind "$PRIVTMP" /tmp --bind "$OUTDIR" "$OUTDIR")
 [ "$ACCESS" = edit ] && ARGS+=(--bind "$CWD" "$CWD")
 ARGS+=(--dev /dev --proc /proc --die-with-parent --chdir "$CWD" --)
 MODE=(); [ "$ACCESS" = edit ] && MODE=(--mode accept-edits)
-SUP="$(python3 "$ROOT/bin/codex-supervise.py" --command 900 "$OUT" "$ERR" "$OUT" "$PROMPT_FILE" "$MODEL" "$CWD" -- "$SANDBOX" "${ARGS[@]}" "$BINARY" -p "$PROMPT" --model "$MODEL" --print-timeout 900s "${MODE[@]}")"
+SUP="$(python3 "$ROOT/bin/codex-supervise.py" --command 900 "$OUT" "$ERR" "$OUT" "$PROMPT_FILE" "$MODEL" "$CWD" -- "$SANDBOX" "${ARGS[@]}" "$BINARY" -p "$PROMPT" --add-dir "$OUTDIR" --model "$MODEL" --print-timeout 900s "${MODE[@]}")"
 python3 - "$SUP" "$POOL" "$MODEL" "$ACCESS" "$CWD" "$OUT" "$ERR" <<'PY'
 import json,os,re,sys
 try: result=json.loads(sys.argv[1])
 except Exception: result={'ok':False,'exit_code':2,'reason':'supervisor produced invalid JSON'}
 pool,model,access,cwd,out,err=sys.argv[2:]
-if result.get('ok'):
- try:
-  stderr=open(err,errors='replace').read()
-  if os.path.getsize(out)==0 and any(x.startswith('jetski: no output produced') for x in stderr.splitlines()):
-   result['ok']=False; result['reason']='agy_permission_denied:'+('write_file' if re.search('write_file',stderr,re.I) else 'command')
- except Exception: pass
+# The supervisor already marks an empty answer as failed; name the real cause when
+# agy says a headless permission prompt was auto-denied.
+try:
+ stderr=open(err,errors='replace').read()
+ if os.path.getsize(out)==0 and any(x.startswith('jetski: no output produced') for x in stderr.splitlines()):
+  m=re.search(r'"([a-z_]+)" permission',stderr)
+  result['ok']=False; result['reason']='agy_permission_denied:'+(m.group(1) if m else 'unknown')
+except Exception: pass
 result.update({'pool':pool,'model':model,'access':access,'cwd':cwd}); result.pop('effort',None); result.pop('sandbox',None)
 print(json.dumps(result)); sys.exit(0 if result.get('ok') else 1)
 PY
