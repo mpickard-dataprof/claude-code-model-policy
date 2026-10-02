@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.1 — unreleased
+
+### Fixed
+
+- `[agy] [edit]` copy-back now stages all files and uses a journalled rename
+  commit with rollback. Failed applies report `edit_rejected:apply_failed` only
+  after restoration; an unrecoverable rollback reports `edit_partial` with an
+  honest applied/restored/unknown/leftovers state. Successful backup-cleanup
+  failures are reported as recoverable leftovers.
+
 ## 0.4.0 — Antigravity offload backends
 
 ### Shipped read-only

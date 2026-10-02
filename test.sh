@@ -1226,17 +1226,43 @@ print(h.hexdigest())
 PY
 }
 json_reason() { printf '%s' "$1" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).reason||"")}catch{}})'; }
+no_agy_transaction_files() { python3 - "$1" <<'PY'
+import os,sys
+for root,ds,fs in os.walk(sys.argv[1]):
+ if any(n.startswith(('.agy-stage-','.agy-bak-')) for n in fs): print('no'); break
+else: print('yes')
+PY
+}
 OFF_POLICY="$SANDBOX/edit-off-policy.json"; "$NODE" -e 'const fs=require("fs"),p=JSON.parse(fs.readFileSync(process.argv[1]));delete p.agy.editEnabled;fs.writeFileSync(process.argv[2],JSON.stringify(p))' "$AGY_POLICY" "$OFF_POLICY"
 WT_OFF="$(edit_wt edit-off)"; before="$(tree_hash "$WT_OFF")"; G_OFF="$(printf '%048x' 3999)"; grant "$G_OFF" thirdparty claude-sonnet-4-6 edit "$WT_OFF" 'edit while off'
 out="$(AGY_POLICY="$OFF_POLICY" AGY_EDIT_ACTION='printf changed > base.txt' agy_wrap --grant "$G_OFF")"
 assert "wrapper refuses edit grants unless policy enables edit" "edit_disabled|$before" "$(json_reason "$out")|$(tree_hash "$WT_OFF")"
 WT_EDIT="$(edit_wt edit-ok)"; G1=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 grant "$G1" thirdparty claude-sonnet-4-6 edit "$WT_EDIT" 'edit ordinary files'
-out="$(AGY_EDIT_ACTION='printf changed\\n > base.txt; mkdir -p src; printf new\\n > src/new.txt; rm delete.txt' agy_wrap --grant "$G1")"
-assert "edit copy applies ordinary add modify delete" yes "$(printf '%s' "$out" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const x=JSON.parse(s);process.stdout.write(x.ok&&x.changes.added.includes("src/new.txt")&&x.changes.modified.includes("base.txt")&&x.changes.deleted.includes("delete.txt")?"yes":"no")}catch{process.stdout.write("no")}})')"
+out="$(AGY_EDIT_ACTION='printf changed\\n > base.txt; printf root\\n > added.txt; mkdir -p src; printf new\\n > src/new.txt; rm delete.txt' agy_wrap --grant "$G1")"
+assert "edit transaction applies modify two adds and delete" yes "$(printf '%s' "$out" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const x=JSON.parse(s);process.stdout.write(x.ok&&x.changes.added.includes("added.txt")&&x.changes.added.includes("src/new.txt")&&x.changes.modified.includes("base.txt")&&x.changes.deleted.includes("delete.txt")?"yes":"no")}catch{process.stdout.write("no")}})')"
+assert "successful edit transaction removes stage and backup files" yes "$(no_agy_transaction_files "$WT_EDIT")"
 assert "edit never binds real worktree rw" yes "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n"),p=process.argv[2];process.stdout.write(a.some((x,i)=>x==="--bind"&&a[i+1]===p&&a[i+2]==="/workspace")?"no":"yes")' "$BWRAP_LOG" "$WT_EDIT")"
 assert "edit copy is removed after run" yes "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n");const i=a.findIndex((x,j)=>x==="--bind"&&a[j+2]==="/workspace");process.stdout.write(i>=0&&!require("fs").existsSync(a[i+1])?"yes":"no")' "$BWRAP_LOG")"
 assert "agy edit mode passes accept-edits" yes "$(grep -qx -- '--mode' "$AGY_LOG" && echo yes || echo no)"
+EDIT_TXN_ACTION='printf changed\\n > base.txt; printf root\\n > added.txt; mkdir -p src; printf new\\n > src/new.txt; rm delete.txt'
+for n in 1 2 3 4 5; do
+  wt="$(edit_wt "txn-fail-$n")"; before="$(tree_hash "$wt")"; id="$(printf '%048x' "$((5000+n))")"; grant "$id" thirdparty claude-sonnet-4-6 edit "$wt" "transaction failure $n"
+  out="$(MODEL_POLICY_AGY_FAIL_AT="$n" AGY_EDIT_ACTION="$EDIT_TXN_ACTION" agy_wrap --grant "$id")"
+  assert "edit commit failure $n rolls back fully" yes "$(r="$(json_reason "$out")"; [[ "$r" == edit_rejected:apply_failed:* && "$before" = "$(tree_hash "$wt")" && ! -e "$wt/src" && "$(no_agy_transaction_files "$wt")" = yes ]] && echo yes || echo no)"
+done
+WT_STAGE="$(edit_wt txn-stage)"; mkdir -p "$WT_STAGE/locked"; chmod 555 "$WT_STAGE/locked"; before="$(tree_hash "$WT_STAGE")"; G_STAGE="$(printf '%048x' 5010)"; grant "$G_STAGE" thirdparty claude-sonnet-4-6 edit "$WT_STAGE" 'stage failure'
+out="$(AGY_EDIT_ACTION='printf changed\\n > base.txt; mkdir -p locked; printf new\\n > locked/new.txt' agy_wrap --grant "$G_STAGE")"; chmod 755 "$WT_STAGE/locked"
+assert "edit staging failure leaves host unchanged" yes "$(r="$(json_reason "$out")"; [[ "$r" == edit_rejected:apply_failed:* && "$before" = "$(tree_hash "$WT_STAGE")" && "$(no_agy_transaction_files "$WT_STAGE")" = yes ]] && echo yes || echo no)"
+WT_PARTIAL="$(edit_wt txn-partial)"; G_PARTIAL="$(printf '%048x' 5011)"; grant "$G_PARTIAL" thirdparty claude-sonnet-4-6 edit "$WT_PARTIAL" 'rollback failure'
+out="$(MODEL_POLICY_AGY_FAIL_AT=2 MODEL_POLICY_AGY_FAIL_ROLLBACK=1 AGY_EDIT_ACTION="$EDIT_TXN_ACTION" agy_wrap --grant "$G_PARTIAL")"
+assert "edit rollback failure reports an honest partial state" yes "$(printf '%s' "$out" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const x=JSON.parse(s);process.stdout.write(x.reason==="edit_partial"&&x.partial&&Array.isArray(x.partial.applied)&&Array.isArray(x.partial.restored)&&Array.isArray(x.partial.unknown)&&Array.isArray(x.partial.leftovers)?"yes":"no")}catch{process.stdout.write("no")}})')"
+WT_CRASH="$(edit_wt txn-crash)"; G_CRASH="$(printf '%048x' 5012)"; grant "$G_CRASH" thirdparty claude-sonnet-4-6 edit "$WT_CRASH" 'copy-back crash'
+out="$(MODEL_POLICY_AGY_FAIL_AT=not-a-number AGY_EDIT_ACTION="$EDIT_TXN_ACTION" agy_wrap --grant "$G_CRASH")"
+assert "a crashed copy-back reports unknown state, never rejected" edit_state_unknown "$(json_reason "$out")"
+WT_BOX_HOOK="$(edit_wt txn-box-hook)"; G_BOX_HOOK="$(printf '%048x' 5012)"; grant "$G_BOX_HOOK" thirdparty claude-sonnet-4-6 edit "$WT_BOX_HOOK" 'box hooks ignored'
+out="$(AGY_EDIT_ACTION='export MODEL_POLICY_AGY_FAIL_AT=1 MODEL_POLICY_AGY_FAIL_ROLLBACK=1; printf changed\\n > base.txt; printf root\\n > added.txt; mkdir -p src; printf new\\n > src/new.txt; rm delete.txt' agy_wrap --grant "$G_BOX_HOOK")"
+assert "edit worker fault-injection exports have no host effect" yes "$(printf '%s' "$out" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const x=JSON.parse(s);process.stdout.write(x.ok&&x.changes.added.length===2&&x.changes.modified.length===1&&x.changes.deleted.length===1?"yes":"no")}catch{process.stdout.write("no")}})')"
 for spec in symlink:'ln -s base.txt evil.txt' hardlink:'ln base.txt linked.txt' dotdir:'mkdir -p .github/workflows; printf x > .github/workflows/x.yml' instruction:'mkdir -p sub; printf x > sub/CLAUDE.md' mode:'chmod +x base.txt' huge:'head -c $((5*1024*1024+1)) /dev/zero > huge.txt' hookdot:'mkdir -p x/.hooks; printf x > x/.hooks/y' baregit:'mkdir -p sub/r.git; printf x > sub/r.git/config' bareshape:'mkdir -p vendor/r/objects vendor/r/refs/heads; printf x > vendor/r/HEAD; printf x > vendor/r/config' filedir:'rm base.txt; mkdir base.txt'; do
   name="${spec%%:*}"; action="${spec#*:}"; wt="$(edit_wt "reject-$name")"; before="$(tree_hash "$wt")"; REJ_N=$((${REJ_N:-0}+1)); id="$(printf '%048x' "$((4000+REJ_N))")"; grant "$id" thirdparty claude-sonnet-4-6 edit "$wt" "reject $name"; out="$(AGY_EDIT_ACTION="$action" agy_wrap --grant "$id")"; after="$(tree_hash "$wt")"; assert "edit rejects $name atomically" yes "$(r="$(json_reason "$out")"; [[ "$r" == edit_rejected:* && "$before" = "$after" ]] && echo yes || echo no)";
 done

@@ -161,11 +161,15 @@ access. The agy OAuth token is also readable inside the box so the CLI can work;
 a prompt-injected run could exfiltrate it. That exposure is inherent to this
 offload design—revoke it on the Google side with `agy logout` if needed.
 
-Why edit mode is off: the round-5 review found that copy-back is not transactional,
-so a write failing mid-apply (disk full, an unwritable directory) leaves part of a
-change set applied while the result says rejected. Do not set `agy.editEnabled`
-until that is fixed and re-reviewed; the wrapper also refuses edit grants while it
-is off. The design below is kept for that work.
+Edit mode remains shipped off (`agy.editEnabled: false`) pending review; the wrapper
+also refuses edit grants while it is off. When enabled for a reviewed deployment,
+copy-back stages every payload in its destination directory, then commits a
+journalled sequence of same-directory renames. A failed commit rolls the whole
+delta back, so `edit_rejected:apply_failed:<path>` means the host tree was restored.
+If rollback itself cannot establish the final state, the result is `edit_partial`
+with `partial.applied`, `partial.restored`, `partial.unknown`, and
+`partial.leftovers`; treat that as an explicit recovery-needed state, never as a
+rejected edit.
 
 For edit runs, review the diff before running anything: edited tests, Makefiles,
 and package scripts run with your normal host permissions when you invoke them.
@@ -173,7 +177,8 @@ For `[agy] [edit]`, Antigravity works in a private throwaway copy of the checkou
 After it exits, the relay validates the complete delta before copying it back: only
 ordinary files with safe non-dot path components are eligible; agent instructions,
 `node_modules`, executable-bit changes, oversized changes, and host conflicts reject
-the whole delta. The result JSON reports every applied path (or the rejected rule).
+the whole delta. Successful results report every applied path and any recoverable
+backup `leftovers`; rejected results name the failed path.
 The sandbox also mitigates, but cannot eliminate, same-UID pathname races; an
 attacker already executing as your user is outside its threat model.
 

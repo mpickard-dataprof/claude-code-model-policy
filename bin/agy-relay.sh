@@ -293,8 +293,8 @@ PY
 )"
 EDIT_RESULT='{}'
 if [ "$ACCESS" = edit ]; then
-  EDIT_RESULT="$(python3 - "$CWD" "$COPYDIR" "$BASELINE" <<'PY'
-import hashlib,json,os,re,stat,sys,tempfile
+  EDIT_RESULT="$(python3 - "$CWD" "$COPYDIR" "$BASELINE" 2>>"$OUTDIR/copyback.err" <<'PY'
+import hashlib,json,os,re,signal,stat,sys,tempfile
 cwd,copy,baseline_path=sys.argv[1:]
 base=json.load(open(baseline_path,encoding='utf-8'))
 valid_component=re.compile(r'^[A-Za-z0-9_][A-Za-z0-9._+-]*$')
@@ -368,6 +368,7 @@ for p in modified+deleted:
  except FileNotFoundError: conflict(p)
  if not stat.S_ISREG(st.st_mode) or sha(hp)!=base[p]['host_sha256']: conflict(p)
  host_modes[p]=stat.S_IMODE(st.st_mode)
+created_dirs=[]
 def parent(rel):
  st=os.lstat(cwd)
  if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode): raise RuntimeError('unsafe parent')
@@ -376,31 +377,142 @@ def parent(rel):
   d=os.path.join(d,part)
   try: st=os.lstat(d)
   except FileNotFoundError:
-   os.mkdir(d,0o755); st=os.lstat(d)
+   os.mkdir(d,0o755); created_dirs.append(d); st=os.lstat(d)
   if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode): raise RuntimeError('unsafe parent')
  return d
+def relpath(path): return os.path.relpath(path,cwd)
+def temp_name(d,prefix):
+ # O_EXCL and O_NOFOLLOW make these names private transaction files.
+ for _ in range(100):
+  p=os.path.join(d,prefix+next(tempfile._get_candidate_names()))
+  if not os.path.lexists(p): return p
+ raise RuntimeError('could not allocate transaction name')
+def clean_staging(stages):
+ failed=[]
+ for p in stages:
+  if os.path.lexists(p):
+   try: os.unlink(p)
+   except Exception: failed.append(relpath(p))
+ for d in reversed(created_dirs):
+  try: os.rmdir(d)
+  except FileNotFoundError: pass
+  except Exception: failed.append(relpath(d))
+ return failed
+class ApplyFailure(Exception):
+ def __init__(self,path): self.path=path
+class ApplySignal(ApplyFailure): pass
+def checked_host(p):
+ hp=os.path.join(cwd,p); st=os.lstat(hp)
+ if not stat.S_ISREG(st.st_mode) or sha(hp)!=base[p]['host_sha256']: raise ApplyFailure(p)
+ return hp
+# Test hooks: relay-only MODEL_POLICY_AGY_FAIL_AT and MODEL_POLICY_AGY_FAIL_ROLLBACK only inject failures; --clearenv keeps them out of the box.
+fail_at=int(os.environ.get('MODEL_POLICY_AGY_FAIL_AT','0') or 0)
+fail_rollback=os.environ.get('MODEL_POLICY_AGY_FAIL_ROLLBACK')=='1'
+rename_count=0; rollback_fault_used=False
+def commit_rename(src,dst,p):
+ global rename_count
+ rename_count+=1
+ if fail_at==rename_count: raise ApplyFailure(p)
+ os.rename(src,dst)
+def signal_abort(signum,frame): raise ApplySignal('')
+old_handlers={}
+stages=[]; journal=[]; failed_path=''
 try:
+ for sig in (signal.SIGTERM,signal.SIGINT,signal.SIGHUP):
+  old_handlers[sig]=signal.getsignal(sig); signal.signal(sig,signal_abort)
  # Resolve (and, where needed, create) every parent before touching a host file,
  # so an unsafe parent cannot yield a partially applied change set.
- for p in added+modified: parent(p)
  for p in added+modified:
-  d=parent(p); mode=0o644 if p in added else host_modes[p]
-  tmp=os.path.join(d,'.agy-copy-'+next(tempfile._get_candidate_names()))
-  fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+  try: parent(p)
+  except Exception: raise ApplyFailure(p)
+ # Stage every new payload before moving any target into the journal.
+ for p in added+modified:
   try:
-   with os.fdopen(fd,'wb') as o, open(os.path.join(copy,p),'rb') as i:
-    for b in iter(lambda:i.read(65536),b''): o.write(b)
-    o.flush(); os.fsync(o.fileno())
-   os.chmod(tmp,mode); os.replace(tmp,os.path.join(cwd,p))
-  finally:
-   if os.path.exists(tmp): os.unlink(tmp)
+   d=parent(p); stage=temp_name(d,'.agy-stage-')
+   fd=os.open(stage,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+   stages.append(stage)
+   try:
+    with os.fdopen(fd,'wb') as o, open(os.path.join(copy,p),'rb') as i:
+     for b in iter(lambda:i.read(65536),b''): o.write(b)
+     o.flush(); os.fsync(o.fileno())
+   except Exception:
+    try: os.close(fd)
+    except Exception: pass
+    raise
+   os.chmod(stage,0o644 if p in added else host_modes[p])
+  except ApplyFailure: raise
+  except Exception: raise ApplyFailure(p)
+ stage_by_path=dict(zip(added+modified,stages))
+ # Commit only renames. Each entry records the durable steps needed to undo it.
+ for p in modified:
+  target=checked_host(p); stage=stage_by_path[p]; backup=temp_name(os.path.dirname(target),'.agy-bak-')
+  item={'path':p,'kind':'modified','target':target,'stage':stage,'backup':backup,'backup_moved':False,'applied':False,'steps':[]}; journal.append(item)
+  if os.path.lexists(backup): raise ApplyFailure(p)
+  commit_rename(target,backup,p); item['backup_moved']=True; item['steps'].append('backup')
+  commit_rename(stage,target,p); item['applied']=True; item['steps'].append('replace')
+ for p in added:
+  target=os.path.join(cwd,p); stage=stage_by_path[p]
+  if os.path.lexists(target): raise ApplyFailure(p)
+  item={'path':p,'kind':'added','target':target,'stage':stage,'backup':None,'backup_moved':False,'applied':False,'steps':[]}; journal.append(item)
+  commit_rename(stage,target,p); item['applied']=True; item['steps'].append('add')
  for p in deleted:
-  hp=os.path.join(cwd,p); st=os.lstat(hp)
-  if not stat.S_ISREG(st.st_mode): raise RuntimeError('unsafe delete')
-  os.unlink(hp)
+  target=checked_host(p); backup=temp_name(os.path.dirname(target),'.agy-bak-')
+  item={'path':p,'kind':'deleted','target':target,'stage':None,'backup':backup,'backup_moved':False,'applied':False,'steps':[]}; journal.append(item)
+  if os.path.lexists(backup): raise ApplyFailure(p)
+  commit_rename(target,backup,p); item['backup_moved']=True; item['applied']=True; item['steps'].append('delete')
+except ApplyFailure as e:
+ failed_path=e.path
 except Exception:
- print(json.dumps({'ok':False,'reason':'edit_rejected:apply_failed:','rejected':{'rule':'apply_failed','path':''}})); raise SystemExit
-print(json.dumps({'ok':True,'changes':{'added':added,'modified':modified,'deleted':deleted}}))
+ failed_path=failed_path or ''
+else:
+ # The transaction is durable; later backup cleanup cannot make it partial.
+ for sig,handler in old_handlers.items(): signal.signal(sig,handler)
+ # Once every rename is committed, backups are merely recoverable leftovers.
+ leftovers=[]
+ for item in journal:
+  if item['backup_moved'] and os.path.lexists(item['backup']):
+   try: os.unlink(item['backup'])
+   except Exception: leftovers.append(relpath(item['backup']))
+ print(json.dumps({'ok':True,'changes':{'added':added,'modified':modified,'deleted':deleted},**({'leftovers':leftovers} if leftovers else {})})); raise SystemExit
+# An interrupted or failed commit rolls its journal backwards. Continue after a
+# rollback error so unrelated paths are restored whenever that is still possible.
+rollback_errors=[]
+for item in reversed(journal):
+ try:
+  if not item['backup_moved'] and not item['applied']: continue
+  if fail_rollback and not rollback_fault_used:
+   rollback_fault_used=True; raise RuntimeError('injected rollback failure')
+  if item['kind']=='added':
+   if os.path.lexists(item['target']): os.unlink(item['target'])
+  elif item['backup_moved'] and os.path.lexists(item['backup']):
+   os.rename(item['backup'],item['target'])
+ except Exception:
+  rollback_errors.append(item['path'])
+stage_leftovers=clean_staging(stages)
+for sig,handler in old_handlers.items(): signal.signal(sig,handler)
+def state(p):
+ hp=os.path.join(cwd,p)
+ try: st=os.lstat(hp)
+ except FileNotFoundError: st=None
+ if p in added:
+  if st is None: return 'restored'
+  if stat.S_ISREG(st.st_mode) and sha(hp)==current[p]['sha256']: return 'applied'
+ elif p in modified:
+  if st and stat.S_ISREG(st.st_mode):
+   h=sha(hp)
+   if h==base[p]['host_sha256']: return 'restored'
+   if h==current[p]['sha256']: return 'applied'
+ elif p in deleted:
+  if st is None: return 'applied'
+  if stat.S_ISREG(st.st_mode) and sha(hp)==base[p]['host_sha256']: return 'restored'
+ return 'unknown'
+leftovers=stage_leftovers[:]
+for item in journal:
+ if item['backup_moved'] and os.path.lexists(item['backup']): leftovers.append(relpath(item['backup']))
+states={p:state(p) for p in changed}
+if rollback_errors or leftovers or any(v!='restored' for v in states.values()):
+ print(json.dumps({'ok':False,'reason':'edit_partial','partial':{'applied':[p for p in changed if states[p]=='applied'],'restored':[p for p in changed if states[p]=='restored'],'unknown':[p for p in changed if states[p]=='unknown'],'leftovers':leftovers}})); raise SystemExit
+print(json.dumps({'ok':False,'reason':'edit_rejected:apply_failed:'+failed_path,'rejected':{'rule':'apply_failed','path':failed_path}}))
 PY
 )"
 fi
@@ -439,11 +551,15 @@ if access=='edit':
  try:
   e=json.loads(edit)
   if e.get('changes') is not None: result['changes']=e['changes']
+  if e.get('partial') is not None: result['partial']=e['partial']
+  if e.get('leftovers') is not None: result['leftovers']=e['leftovers']
   if not e.get('ok',False):
    result.update({'ok':False,'reason':e.get('reason','edit_rejected:unknown:')})
    if e.get('rejected') is not None: result['rejected']=e['rejected']
  except Exception:
-  result.update({'ok':False,'reason':'edit_rejected:validation_failed:'})
+  # No result from copy-back (it crashed or was killed): the host state is not
+  # known, so never claim the change set was rejected.
+  result.update({'ok':False,'reason':'edit_state_unknown','check':'git -C %s status --short' % cwd})
 cap=200*1024
 answer,answer_size=safe_read(out); truncated=answer_size>cap
 result['truncated']=truncated
