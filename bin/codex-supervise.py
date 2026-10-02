@@ -34,6 +34,29 @@ import time
 GRACE_SECONDS = 5
 
 
+def safe_regular_open(path, flags, mode=0o600):
+    """Open a regular file without following a same-UID planted symlink."""
+    fd = os.open(path, flags | os.O_NOFOLLOW, mode)
+    try:
+        if not __import__('stat').S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("not a regular file")
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def safe_regular_size(path):
+    try:
+        fd = safe_regular_open(path, os.O_RDONLY)
+        try:
+            return os.fstat(fd).st_size
+        finally:
+            os.close(fd)
+    except Exception:
+        return 0
+
+
 def emit(**kw):
     """The ONE emission path. Reached AT MOST ONCE per invocation.
 
@@ -131,8 +154,8 @@ def main():
 
     try:
         fin = open(task_path, "rb")
-        fout = open(stdout_path, "wb")
-        ferr = open(err_path, "wb")
+        fout = os.fdopen(safe_regular_open(stdout_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC), "wb")
+        ferr = os.fdopen(safe_regular_open(err_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC), "wb")
     except Exception as exc:
         emit(reason="could not open worker io: %s" % exc, exit_code=2,
              model=model, effort=effort, sandbox=sandbox)
@@ -241,7 +264,7 @@ def main():
     elapsed = int(time.time() - started)
     nbytes = 0
     try:
-        nbytes = os.path.getsize(out_path)
+        nbytes = safe_regular_size(out_path)
     except Exception:
         pass
 
@@ -286,7 +309,7 @@ def main():
             # Seek, do not slurp. A noisy failing worker can write a very large
             # stderr log, and reading all of it to keep 600 characters put the
             # memory pressure exactly where the failure report was needed.
-            with open(err_path, "rb") as fh:
+            with os.fdopen(safe_regular_open(err_path, os.O_RDONLY), "rb") as fh:
                 fh.seek(0, os.SEEK_END)
                 fh.seek(max(0, fh.tell() - 4096))
                 # read(4096), not read(): a still-running logger appending after

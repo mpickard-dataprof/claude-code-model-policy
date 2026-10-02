@@ -3,6 +3,13 @@
 # stdin and asserts the resolved model. Runs against a throwaway ledger.
 set -uo pipefail
 
+# Undefined helpers otherwise return 127 but can be hidden inside a command
+# substitution. Make that a loud, terminal harness failure.
+command_not_found_handle() {
+  printf 'FATAL: unknown test command: %s\n' "$1" >&2
+  exit 127
+}
+
 DIR="$(cd "$(dirname "$0")" && pwd)"
 GATE="$DIR/hooks/gate.mjs"
 RUN="$DIR/hooks/run.sh"
@@ -70,6 +77,19 @@ check() {
     printf '  \033[31mFAIL\033[0m  %-46s -> %s (expected %s)\n' "$name" "$got" "$expect"; FAIL=$((FAIL+1))
   fi
 }
+
+assert() { # <name> <expected> <actual>
+  if [ "$2" = "$3" ]; then
+    printf '  \033[32mPASS\033[0m  %-46s -> %s\n' "$1" "$3"; PASS=$((PASS+1))
+  else
+    printf '  \033[31mFAIL\033[0m  %-46s -> %s (expected %s)\n' "$1" "$3" "$2"; FAIL=$((FAIL+1))
+  fi
+}
+
+assert "assert helper precedes every use" yes \
+  "$(awk '/^assert\(\)/ { defined=NR } /^[[:space:]]*assert / && !defined { bad=1 } END { print bad ? "no" : "yes" }' "$0")"
+assert "unknown command handler is fatal" 127 \
+  "$(bash -c 'command_not_found_handle() { exit 127; }; nonexistent_test_helper >/dev/null 2>&1; printf "%s" "$?"')"
 
 agent() { # <session_id> <inner-json>
   printf '{"session_id":"%s","tool_use_id":"t1","hook_event_name":"PreToolUse","tool_name":"Agent","tool_input":{%s}}' "$1" "$2"
@@ -286,10 +306,10 @@ done
 check "agy relay denies Edit" DENY '{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Edit","agent_type":"agy","tool_input":{"file_path":"/tmp/x"}}'
 check "agy relay denies NotebookEdit" DENY '{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"NotebookEdit","agent_type":"agy","tool_input":{"notebook_path":"/tmp/x"}}'
 MERGE_FIXTURE="$SANDBOX/merge-fixture"; mkdir -p "$MERGE_FIXTURE"
-printf '%s\n' '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"custom-hook"},{"type":"command","command":"old/hooks/gate.mjs"}]}]}}' > "$MERGE_FIXTURE/settings.json"
+printf '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"custom-hook"},{"type":"command","command":"%s"}]}]}}\n' "$DIR/hooks/gate.mjs" > "$MERGE_FIXTURE/settings.json"
 "$NODE" "$DIR/install-merge.mjs" "$MERGE_FIXTURE" "$DIR/hooks" >/dev/null
 assert "installer isolates gate from a shared custom-hook group" yes \
-  "$("$NODE" -e 'const s=require(process.argv[1]);const g=s.hooks.PreToolUse;const custom=g.find(x=>x.hooks.some(h=>h.command==="custom-hook"));const own=g.find(x=>x.hooks.some(h=>h.command.includes("gate.mjs")));process.stdout.write(custom?.matcher==="Bash"&&own!==custom&&own?.matcher.includes("Read")?"yes":"no")' "$MERGE_FIXTURE/settings.json")"
+  "$("$NODE" -e 'const s=require(process.argv[1]);const g=s.hooks.PreToolUse;const custom=g.find(x=>x.hooks.some(h=>h.command==="custom-hook"));const own=g.find(x=>x.hooks.some(h=>h.command.includes("gate.mjs")));process.stdout.write(custom?.matcher==="Bash"&&own!==custom&&own?.matcher==="Agent|Workflow|Bash"?"yes":"no")' "$MERGE_FIXTURE/settings.json")"
 check "malformed stdin"                NOOP 'not json at all'
 check "empty stdin"                    NOOP ''
 check "missing tool_input"             NOOP '{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Agent"}'
@@ -306,18 +326,13 @@ if [ -z "$got" ]; then
 else
   printf '  \033[31mFAIL\033[0m  %-46s -> %s (expected NOOP)\n' "corrupt policy.json" "$got"; FAIL=$((FAIL+1))
 fi
+got="$(printf '%s' '{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Bash","agent_type":"agy","tool_input":{"command":"id"}}' \
+  | env MODEL_POLICY_POLICY="$SANDBOX/broken-policy.json" sh "$RUN" "$GATE" 2>/dev/null)"
+assert "corrupt policy fails closed for fallback agy" yes "$(printf '%s' "$got" | grep -q 'permissionDecision":"deny' && echo yes || echo no)"
 unset check_env
 
 echo
 echo "== Regression guards =="
-
-assert() { # <name> <expected> <actual>
-  if [ "$2" = "$3" ]; then
-    printf '  \033[32mPASS\033[0m  %-46s -> %s\n' "$1" "$3"; PASS=$((PASS+1))
-  else
-    printf '  \033[31mFAIL\033[0m  %-46s -> %s (expected %s)\n' "$1" "$3" "$2"; FAIL=$((FAIL+1))
-  fi
-}
 
 # A typo in policy.json must never be written into `model` — that would fail the
 # spawn, which is the opposite of failing open.
@@ -1105,6 +1120,15 @@ agy_route '[agy]' 'review safely' "$HOME"
 assert "home cwd falls back to native routing" general-purpose \
   "$(printf '%s' "$AGY_ROUTE_OUT" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).hookSpecificOutput.updatedInput.subagent_type)}catch{process.stdout.write("general-purpose")}})')"
 
+# Cwd admission compares path components. These four cases caught the old '/'
+# string-prefix bypass and ensure descendants of HOME remain usable.
+CWD_HOME="$SANDBOX/cwd-home"; mkdir -p "$CWD_HOME/x"
+for pair in "/:false" "/home:false" "$CWD_HOME:false" "$CWD_HOME/x:true"; do
+  cwd_case="${pair%:*}"; expected="${pair##*:}"
+  assert "agy cwd component guard: $cwd_case" "$expected" \
+    "$(HOME="$CWD_HOME" "$NODE" --input-type=module -e 'const {agyCwdAllowed}=await import(process.argv[1]);process.stdout.write(String(agyCwdAllowed(process.argv[2])))' "file://$DIR/hooks/lib.mjs" "$cwd_case")"
+done
+
 # Spill inputs are deliberately validated narrowly: JSON coercion must not turn
 # a malformed status line into a backend switch.
 for bad in '{"five_hour_pct":"99","ts":999}' '{"five_hour_pct":"NaN","ts":999}' '{"five_hour_pct":101,"ts":999}' '{"five_hour_pct":-1,"ts":999}' '{"five_hour_pct":99,"ts":1001}'; do
@@ -1136,7 +1160,7 @@ assert "codex.tagFrom is honoured" codex "$(printf '%s' "$(agent "$S_AGY" '"suba
 AGY_HOME="$SANDBOX/agy-home"
 FAKE_AGY="$AGY_HOME/.local/bin/agy"
 mkdir -p "$(dirname "$FAKE_AGY")"
-printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\\n" "$@" > "${AGY_ARGV_LOG:-/dev/null}"' 'if [ -n "${AGY_PLANT_NESTED:-}" ]; then mkdir -p "$PWD/nested/.git"; fi' 'if [ -n "${AGY_BIG_ANSWER:-}" ]; then head -c 205000 /dev/zero | tr "\\0" x; else case "$*" in *PERMDENY*) printf "jetski: no output produced\\n" ;; *) printf "AGY-ANSWER\\n" ;; esac; fi' > "$FAKE_AGY"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\\n" "$@" > "${AGY_ARGV_LOG:-/dev/null}"' 'if [ -n "${AGY_PLANT_NESTED:-}" ]; then mkdir -p "$PWD/nested/.git"; fi' 'if [ -n "${AGY_SYMLINK_TARGET:-}" ]; then ln -sf "$AGY_SYMLINK_TARGET" /relay/answer.md 2>/dev/null || true; fi' 'if [ -n "${AGY_BIG_ANSWER:-}" ]; then head -c 205000 /dev/zero | tr "\\0" x; else case "$*" in *PERMDENY*) printf "jetski: no output produced\\n" ;; *) printf "AGY-ANSWER\\n" ;; esac; fi' > "$FAKE_AGY"
 chmod +x "$FAKE_AGY"
 AGY_POLICY="$SANDBOX/agy-policy.json"
 "$NODE" -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));p.agy.binary=process.argv[2];fs.writeFileSync(process.argv[3],JSON.stringify(p));' "$DIR/policy.json" "$FAKE_AGY" "$AGY_POLICY"
@@ -1175,8 +1199,10 @@ chmod +x "$FAKE_BWRAP"
 mkdir -p "$SANDBOX/.worktrees/x" "$MODEL_POLICY_GRANTS"
 git init -q "$SANDBOX/.worktrees/x"
 grant() { "$NODE" -e 'const fs=require("fs"),path=require("path");const [d,id,pool,model,access,cwd,task]=process.argv.slice(1);fs.writeFileSync(path.join(d,id+".task"),task,{mode:0o600});fs.writeFileSync(path.join(d,id+".json"),JSON.stringify({pool,model,access,cwd,task_path:path.join(d,id+".task"),session_id:"s",created:new Date().toISOString(),expires:new Date(Date.now()+3600000).toISOString()})+"\n",{mode:0o600});' "$MODEL_POLICY_GRANTS" "$@"; }
-agy_wrap_full() { env HOME="$AGY_HOME" MODEL_POLICY_POLICY="$AGY_POLICY" AGY_ARGV_LOG="$AGY_LOG" BWRAP_ARGV_LOG="$BWRAP_LOG" AGY_BIG_ANSWER="${AGY_BIG_ANSWER:-}" AGY_PLANT_NESTED="${AGY_PLANT_NESTED:-}" bash "$DIR/bin/agy-relay.sh" "$@" 2>&1; }
+agy_wrap_full() { env HOME="$AGY_HOME" MODEL_POLICY_POLICY="$AGY_POLICY" AGY_ARGV_LOG="$AGY_LOG" BWRAP_ARGV_LOG="$BWRAP_LOG" AGY_BIG_ANSWER="${AGY_BIG_ANSWER:-}" AGY_PLANT_NESTED="${AGY_PLANT_NESTED:-}" AGY_SYMLINK_TARGET="${AGY_SYMLINK_TARGET:-}" bash "$DIR/bin/agy-relay.sh" "$@" 2>&1; }
 agy_wrap() { agy_wrap_full "$@" | sed -n '1p'; }
+mkdir -p "$SANDBOX/.worktrees/x/.vscode" "$SANDBOX/.worktrees/x/.idea" "$SANDBOX/.worktrees/x/.github/workflows" "$SANDBOX/.worktrees/x/.husky"
+printf 'host config\n' > "$SANDBOX/.worktrees/x/AGENTS.md"
 G1=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 grant "$G1" thirdparty claude-sonnet-4-6 edit "$SANDBOX/.worktrees/x" 'review this'
 out="$(agy_wrap --grant "$G1")"
@@ -1189,6 +1215,10 @@ assert "edit grant binds captured cwd read-write at workspace" yes \
 assert "edit re-binds the top-level .git readonly" yes \
   "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n"),p=process.argv[2]+"/.git";process.stdout.write(a.some((x,i)=>x==="--ro-bind"&&a[i+1]===p&&a[i+2]==="/workspace/.git")?"yes":"no")' "$BWRAP_LOG" "$SANDBOX/.worktrees/x")"
 assert "bwrap has private tmp before worktree bind" yes "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n");const t=a.findIndex((x,i)=>x==="--bind"&&a[i+2]==="/tmp"),w=a.findIndex((x,i)=>x==="--bind"&&a[i+2]==="/workspace");process.stdout.write(t>=0&&w>t?"yes":"no")' "$BWRAP_LOG")"
+assert "edit mask tmpfses every configured directory" yes \
+  "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n"),d=[".claude",".vscode",".idea",".github/workflows",".husky"];process.stdout.write(d.every(n=>a.some((x,i)=>x==="--tmpfs"&&a[i+1]==="/workspace/"+n))?"yes":"no")' "$BWRAP_LOG")"
+assert "edit mask preserves existing files readonly and blocks absent files" yes \
+  "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n"),w=process.argv[2];const existing=a.some((x,i)=>x==="--ro-bind"&&a[i+1]===w+"/AGENTS.md"&&a[i+2]==="/workspace/AGENTS.md"),absent=a.some((x,i)=>x==="--ro-bind"&&a[i+1]==="/dev/null"&&a[i+2]==="/workspace/.envrc");process.stdout.write(existing&&absent?"yes":"no")' "$BWRAP_LOG" "$SANDBOX/.worktrees/x")"
 assert "used grant cannot be replayed" grant_already_used "$(agy_wrap --grant "$G1" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).reason)}catch{}})')"
 G_BAD_GIT=abababababababababababababababababababababababab
 mkdir -p "$SANDBOX/.worktrees/no-git"
@@ -1197,6 +1227,16 @@ assert "edit grant without a top-level .git is refused" grant_invalid "$(agy_wra
 G_BAD_CWD=acacacacacacacacacacacacacacacacacacacacacacacac
 grant "$G_BAD_CWD" thirdparty claude-sonnet-4-6 read-only "$AGY_HOME" 'bad cwd'
 assert "wrapper refuses a secret-bearing cwd" cwd_not_allowed "$(agy_wrap --grant "$G_BAD_CWD" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).reason)}catch{}})')"
+mkdir -p "$AGY_HOME/x"
+G_ROOT=babababababababababababababababababababababababa
+G_HOME_PARENT=cacacacacacacacacacacacacacacacacacacacacacacaca
+G_HOME_X=dadadadadadadadadadadadadadadadadadadadadadadada
+grant "$G_ROOT" thirdparty claude-sonnet-4-6 read-only / 'root cwd'
+grant "$G_HOME_PARENT" thirdparty claude-sonnet-4-6 read-only /home 'shallow cwd'
+grant "$G_HOME_X" thirdparty claude-sonnet-4-6 read-only "$AGY_HOME/x" 'descendant cwd'
+assert "wrapper rejects / cwd" cwd_not_allowed "$(agy_wrap --grant "$G_ROOT" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).reason)}catch{}})')"
+assert "wrapper rejects /home cwd" cwd_not_allowed "$(agy_wrap --grant "$G_HOME_PARENT" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).reason)}catch{}})')"
+assert "wrapper permits $HOME/x cwd" true "$(agy_wrap --grant "$G_HOME_X" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String(JSON.parse(s).ok))}catch{}})')"
 G_NESTED=adadadadadadadadadadadadadadadadadadadadadadadad
 grant "$G_NESTED" thirdparty claude-sonnet-4-6 edit "$SANDBOX/.worktrees/x" 'nested git'
 out="$(AGY_PLANT_NESTED=1 agy_wrap --grant "$G_NESTED")"
@@ -1243,6 +1283,27 @@ assert "linked worktree common git dir is read-only bound" yes \
   "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n"),p=process.argv[2];process.stdout.write(a.some((x,i)=>x==="--ro-bind"&&a[i+1]===p&&a[i+2]===p)?"yes":"no")' "$BWRAP_LOG" "$GIT_COMMON")"
 assert "read-only grant has no writable checkout bind" yes \
   "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n");process.stdout.write(a.some((x,i)=>x==="--bind"&&a[i+2]==="/workspace")?"no":"yes")' "$BWRAP_LOG")"
+assert "bwrap never mounts /run and isolates IPC/process/session/UTS" yes \
+  "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n"),opts=["--unshare-ipc","--unshare-pid","--new-session","--unshare-uts","--clearenv"];const run=a.some((x,i)=>(x==="--bind"||x==="--ro-bind")&&a[i+1]==="/run"&&a[i+2]==="/run");process.stdout.write(!run&&opts.every(x=>a.includes(x))?"yes":"no")' "$BWRAP_LOG")"
+assert "bwrap keeps only the five approved environment variables" yes \
+  "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n"),got=[];for(let i=0;i<a.length;i++)if(a[i]==="--setenv")got.push(a[i+1]);process.stdout.write(a.includes("--clearenv")&&got.sort().join(",")==="HOME,LANG,PATH,TERM,TZ"?"yes":"no")' "$BWRAP_LOG")"
+RESOLV_TARGET_TEST="$(realpath /etc/resolv.conf 2>/dev/null || true)"
+if [ -n "$RESOLV_TARGET_TEST" ] && [ -f "$RESOLV_TARGET_TEST" ]; then
+  assert "DNS exposes only resolved resolv.conf file" yes \
+    "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n"),p=process.argv[2];const own=a.some((x,i)=>x==="--ro-bind"&&a[i+1]===p&&a[i+2]===p),etc=a.some((x,i)=>x==="--ro-bind"&&a[i+1]===p&&a[i+2]==="/etc/resolv.conf");process.stdout.write(own&&etc?"yes":"no")' "$BWRAP_LOG" "$RESOLV_TARGET_TEST")"
+fi
+
+# A malicious worker used to replace /relay/answer.md with this symlink, which
+# the wrapper reopened by name. The relay now has task input only and stdout is
+# already held by the supervisor, so the host secret must never be relayed.
+SECRET_TARGET="$SANDBOX/relay-secret"; printf 'DO-NOT-EXFILTRATE\n' > "$SECRET_TARGET"
+G_SYMLINK=edededededededededededededededededededededededed
+grant "$G_SYMLINK" thirdparty claude-sonnet-4-6 read-only "$GIT_WT" 'symlink sabotage'
+out="$(AGY_SYMLINK_TARGET="$SECRET_TARGET" agy_wrap_full --grant "$G_SYMLINK")"
+assert "relay symlink sabotage cannot exfiltrate host content" no \
+  "$(printf '%s' "$out" | grep -q 'DO-NOT-EXFILTRATE' && echo yes || echo no)"
+assert "relay mounts only a readonly task, never writable output" yes \
+  "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n");const task=a.some((x,i)=>x==="--ro-bind"&&a[i+2]==="/relay/task.md"),relay=a.some((x,i)=>x==="--bind"&&a[i+2]==="/relay");process.stdout.write(task&&!relay?"yes":"no")' "$BWRAP_LOG")"
 
 DENY_AGY="$SANDBOX/permission-denied-agy"
 printf '%s\n' '#!/usr/bin/env bash' 'printf "jetski: no output produced: \\\"read_file\\\" permission denied\n" >&2' > "$DENY_AGY"

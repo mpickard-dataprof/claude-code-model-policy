@@ -341,8 +341,15 @@ export function agyCwdAllowed(cwd) {
   try {
     const dir = realpathSync(typeof cwd === 'string' && cwd ? cwd : process.cwd());
     const home = realpathSync(process.env.HOME || homedir());
-    // Includes $HOME itself and every ancestor of it.
-    if (home === dir || home.startsWith(`${dir}/`)) return false;
+    // Reject shallow paths too. In particular, string-prefix logic turns
+    // `cwd + '/'` into `//` for '/', accidentally allowing the filesystem root.
+    const dirParts = dir.split('/').filter(Boolean);
+    const homeParts = home.split('/').filter(Boolean);
+    if (dir === '/' || dirParts.length < 2) return false;
+    // Component-prefix comparison is equivalent to commonpath([home, dir]) ===
+    // dir, without confusing /home/me with /home/meaningful.
+    if (dirParts.length <= homeParts.length
+      && dirParts.every((part, i) => homeParts[i] === part)) return false;
     return !readdirSync(dir).some((name) => name === '.gemini' || name === '.ssh'
       || name === '.claude' || name.startsWith('.claude'));
   } catch { return false; }

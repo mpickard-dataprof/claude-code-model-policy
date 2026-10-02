@@ -1,11 +1,11 @@
 #!/usr/bin/env node
-// PreToolUse hook, matcher: Agent|Workflow|Bash|Read|Glob|Grep|Write|Edit|NotebookEdit
+// PreToolUse hook, matcher: Agent|Workflow|Bash
 //
 // Agent    -> rewrites tool_input.model to the policy tier.
 // Workflow -> denies only a wide fan-out that sets no models at all.
 //
-// Fail-open by contract: any error exits 0 with no stdout, and the tool call
-// proceeds exactly as it would have without this hook.
+// Fail-open by contract except for the hard-coded `agy` courier. A broken
+// policy must never turn that privileged relay into an unrestricted agent.
 
 import {
   readStdin, parseJson, loadPolicy, resolveTier, sessionRecordFor, normalizeModel,
@@ -27,12 +27,29 @@ const TIER_TABLE = [
   'fable  - reserve for the genuinely hardest work only',
 ].join('\n  ');
 
+let agyFallbackRelay = false;
+function denyAgyOnFailure() {
+  emit({
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse', permissionDecision: 'deny',
+      permissionDecisionReason: 'model-policy: the agy relay is locked while its policy is unavailable.',
+    },
+  });
+}
+
 async function main() {
   const input = parseJson(await readStdin());
   if (!input) return;
 
+  // This fallback name is intentional. It protects the shipped relay even if
+  // loading policy.json fails before we can discover a configured alias.
+  agyFallbackRelay = input.agent_type === 'agy';
+
   const policy = loadPolicy();
-  if (!policy) return; // invalid policy -> behave as if the hook were absent
+  if (!policy) {
+    if (agyFallbackRelay) denyAgyOnFailure();
+    return;
+  }
 
   const tool = input.tool_name;
   const toolInput = input.tool_input || {};
@@ -507,4 +524,7 @@ async function main() {
   }
 }
 
-main().catch(() => { /* fail open */ });
+main().catch(() => {
+  if (agyFallbackRelay) denyAgyOnFailure();
+  // All other hooks retain the normal fail-open behaviour.
+});

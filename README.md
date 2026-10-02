@@ -144,15 +144,25 @@ inside a mandatory Linux `bwrap` sandbox; without bubblewrap the tags are inacti
 `[gpt]` > `[agy]` > `[gemini]`.
 
 The sandbox default-denies your home directory and rejects a cwd that is home, an
-ancestor of home, or contains `.claude*`, `.gemini`, or `.ssh`. Gemini configuration
-is read-only; only Antigravity CLI runtime state is writable. It re-exposes the
-executable, granted checkout, checkout's shared Git metadata, and private relay
-output. This does not make an untrusted repository safe: the
-model can read every file in the repository under review (including secrets kept
-there) and it retains network access, so it could exfiltrate that material.
+ancestor of home, too shallow to safely mount, or contains `.claude*`, `.gemini`,
+or `.ssh`. Gemini configuration is read-only; only Antigravity CLI runtime state
+is writable. It re-exposes the executable, granted checkout, checkout's shared Git
+metadata, and a task file (worker output is captured by the host supervisor, not
+mounted into the box). `/run` is never mounted. Network access is intentionally
+shared, so localhost and abstract Unix sockets remain a residual risk.
+
+This does not make an untrusted repository safe: the model can read every file in
+the repository under review (including secrets kept there) and it retains network
+access. The agy OAuth token is also readable inside the box so the CLI can work;
+a prompt-injected run could exfiltrate it. That exposure is inherent to this
+offload design—revoke it on the Google side with `agy logout` if needed.
 
 For edit runs, review the diff before running anything: edited tests, Makefiles,
 and package scripts run with your normal host permissions when you invoke them.
+The sandbox masks `.claude`, `.vscode`, `.idea`, `.github/workflows`, `.husky`,
+`.mcp.json`, `.envrc`, `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `GEMINI.md`,
+and `.claude.json` (configurable through `agy.sandbox.editMask`), so `[agy] [edit]`
+cannot edit those files.
 The sandbox also mitigates, but cannot eliminate, same-UID pathname races; an
 attacker already executing as your user is outside its threat model.
 

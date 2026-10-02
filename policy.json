@@ -146,7 +146,11 @@
     "sandbox": {
       "_comment": "Linux bubblewrap is mandatory: agy is unavailable when this executable is absent.",
       "bwrap": "/usr/bin/bwrap",
-      "hide": ["$HOME/.ssh", "$HOME/.gnupg", "$HOME/.aws", "$HOME/.claude*", "$HOME/.config", "$HOME/.local/share/keyrings", "$HOME/.docker", "$HOME/.kube", "$HOME/.netrc"]
+      "hide": ["$HOME/.ssh", "$HOME/.gnupg", "$HOME/.aws", "$HOME/.claude*", "$HOME/.config", "$HOME/.local/share/keyrings", "$HOME/.docker", "$HOME/.kube", "$HOME/.netrc"],
+      "editMask": {
+        "dirs": [".claude", ".vscode", ".idea", ".github/workflows", ".husky"],
+        "files": [".mcp.json", ".envrc", "CLAUDE.md", "CLAUDE.local.md", "AGENTS.md", "GEMINI.md", ".claude.json"]
+      }
     },
     "pools": {
       "gemini": {
