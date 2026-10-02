@@ -1,18 +1,20 @@
 #!/usr/bin/env node
-// PreToolUse hook, matcher: Agent|Workflow
+// PreToolUse hook, matcher: Agent|Workflow|Bash
 //
 // Agent    -> rewrites tool_input.model to the policy tier.
 // Workflow -> denies only a wide fan-out that sets no models at all.
 //
-// Fail-open by contract: any error exits 0 with no stdout, and the tool call
-// proceeds exactly as it would have without this hook.
+// Fail-open by contract except for the hard-coded `agy` courier. A broken
+// policy must never turn that privileged relay into an unrestricted agent.
 
 import {
   readStdin, parseJson, loadPolicy, resolveTier, sessionRecordFor, normalizeModel,
   sessionTierFromTranscript, writeSessionTier, tierIndex, promptFingerprint,
   stripCodeNoise, injectWorkflowTiers, resolveWorkflowScript, sessionTierFor,
-  ledger, emit, recordSessionEvent, promptHash, resolveCodexOffload,
+  ledger, emit, recordSessionEvent, promptHash, resolveCodexOffload, resolveAgyOffload,
+  offloadTag, issueAgyGrant, agyRelayPreamble, agyCwdAllowed, ROOT,
 } from './lib.mjs';
+import { join } from 'node:path';
 
 // How long a cached session model is trusted before the transcript is re-read.
 // Bounds how stale the clamp can get after a mid-session /model change.
@@ -25,15 +27,54 @@ const TIER_TABLE = [
   'fable  - reserve for the genuinely hardest work only',
 ].join('\n  ');
 
+let agyFallbackRelay = false;
+function denyAgyOnFailure() {
+  emit({
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse', permissionDecision: 'deny',
+      permissionDecisionReason: 'model-policy: the agy relay is locked while its policy is unavailable.',
+    },
+  });
+}
+
 async function main() {
   const input = parseJson(await readStdin());
   if (!input) return;
 
+  // This fallback name is intentional. It protects the shipped relay even if
+  // loading policy.json fails before we can discover a configured alias.
+  agyFallbackRelay = input.agent_type === 'agy';
+
   const policy = loadPolicy();
-  if (!policy) return; // invalid policy -> behave as if the hook were absent
+  if (!policy) {
+    if (agyFallbackRelay) denyAgyOnFailure();
+    return;
+  }
 
   const tool = input.tool_name;
   const toolInput = input.tool_input || {};
+
+  // This hook now receives every Bash/write call. Keep ordinary calls on the
+  // hot path: no ledger, no session I/O, no output. Claude Code adds agent_type
+  // only for subagent calls, which is the provenance boundary for this relay.
+  if (tool !== 'Agent' && tool !== 'Workflow') {
+    if (input.agent_type !== 'agy') return;
+    const wrapper = join(ROOT, 'bin', 'agy-relay.sh').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const command = typeof toolInput.command === 'string' ? toolInput.command : '';
+    // `(?![\\s\\S])` is an absolute end-of-string assertion.  JavaScript's `$`
+    // also matches immediately before a trailing newline, which made
+    // `bash ... --grant <id>\n<another command>` look like the exact command.
+    if (tool === 'Bash' && new RegExp(`^bash ${wrapper} --grant [a-f0-9]{48}(?![\\s\\S])`).test(command)) return;
+    emit({
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse', permissionDecision: 'deny',
+        permissionDecisionReason: tool === 'Bash'
+          ? 'model-policy: the agy relay may only run its exact gate-issued grant command.'
+          : 'model-policy: the agy relay may only run its exact gate-issued grant command.',
+      },
+    });
+    return;
+  }
 
   if (tool === 'Agent') {
     // A real spawn always carries a prompt string. If it does not, this payload is
@@ -67,7 +108,10 @@ async function main() {
         // record's provenance — overwriting `via`/`agents` here would silently
         // disable effort tiering for the rest of the session.
         const carried = record?.via === 'sessionstart' && Array.isArray(record.agents)
-          ? { via: 'sessionstart', agents: record.agents }
+          ? {
+            via: 'sessionstart', agents: record.agents,
+            ...(Object.hasOwn(record, 'agy_available') ? { agy_available: record.agy_available } : {}),
+          }
           : { via: 'transcript' };
         writeSessionTier(input.session_id, sessionTier, carried);
         record = { model: sessionTier, at: new Date().toISOString(), ...carried };
@@ -113,8 +157,24 @@ async function main() {
     // been on disk when this session loaded its definitions, or the spawn dies
     // with "Agent type not found".
     const cx = policy.codex || {};
+    const agy = policy.agy || {};
+    // The installed relay identity is immutable. A stale/custom policy spelling
+    // is a kill switch, never an alias which escapes the fail-closed fallback.
+    const agyEnabled = agy.enabled === true
+      && (!Object.hasOwn(agy, 'agent') || agy.agent === 'agy');
     const isRelayType = typeof cx.agent === 'string' && cx.agent.length > 0
       && currentType === cx.agent;
+    const isAgyRelayType = currentType === 'agy';
+
+    if (isAgyRelayType && offloadTag(toolInput.description, policy) === 'codex') {
+      emit({
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse', permissionDecision: 'deny',
+          permissionDecisionReason: 'model-policy: a direct agy relay spawn contradicts the higher-precedence [gpt] tag.',
+        },
+      });
+      return;
+    }
 
     // Naming the relay agent directly is a route into the subprocess that does
     // not pass the offload decision at all — so with offloading disabled, a
@@ -143,6 +203,25 @@ async function main() {
       });
       return;
     }
+    if (isAgyRelayType && (agyEnabled !== true || record?.agy_available !== true)) {
+      ledger({
+        event: 'route', tool: 'Agent', session_id: input.session_id, tool_use_id: input.tool_use_id,
+        agent_type: currentType, description: String(toolInput.description ?? '').slice(0, 120),
+        rule: agyEnabled !== true ? 'deny:agy-disabled' : 'deny:agy-unavailable', denied: true,
+      }, policy.limits?.ledgerMaxBytes);
+      emit({
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse', permissionDecision: 'deny',
+          permissionDecisionReason:
+            agyEnabled !== true
+              ? 'model-policy: Antigravity offload is disabled (agy.enabled is not true), so the '
+                + '`agy` relay agent cannot be spawned. Use a normal agent type.'
+              : 'model-policy: Antigravity is unavailable for this session, so the '
+                + '`agy` relay agent cannot be spawned. Use a normal agent type.',
+        },
+      });
+      return;
+    }
 
     // Score a DIRECT relay call as if the type had not been named.
     //
@@ -155,7 +234,7 @@ async function main() {
     // at high. Same work, quietly weaker worker, and a clean exit hiding it.
     let offloadTier = tier;
     let offloadRule = rule;
-    if (isRelayType) {
+    if (isRelayType || isAgyRelayType) {
       const scored = resolveTier({ ...toolInput, subagent_type: '' }, policy, sessionTier);
       if (tierIndex(scored.tier, policy.tierOrder) !== null) {
         offloadTier = scored.tier;
@@ -166,7 +245,42 @@ async function main() {
       }
     }
 
-    const offload = resolveCodexOffload(toolInput, policy, offloadTier, currentType, record);
+    // Explicit tags are authoritative across backends: [gpt] > [agy] > [gemini].
+    // With no tag, preserve Codex's existing auto route before considering the
+    // usage-window spill; the shipped Codex auto list is empty.
+    const tag = offloadTag(toolInput.description, policy);
+    let offload = null;
+    let offloadBackend = null;
+    if (tag === 'codex' || !tag) {
+      offload = resolveCodexOffload(toolInput, policy, offloadTier, currentType, record);
+      offloadBackend = offload ? 'codex' : null;
+    }
+    let agyCwdRejected = false;
+    if (agyEnabled && !offload && (tag?.startsWith('agy:') || !tag || isAgyRelayType)) {
+      if (!agyCwdAllowed(input.cwd)) {
+        // Do not spawn a relay merely to fail in the wrapper: native routing is
+        // safe, and this ledger entry makes the fallback observable.
+        agyCwdRejected = true;
+        ledger({ event: 'route', tool: 'Agent', session_id: input.session_id,
+          tool_use_id: input.tool_use_id, agent_type: currentType,
+          reason: 'cwd_not_allowed', offload: 'agy', denied: false,
+        }, policy.limits?.ledgerMaxBytes);
+      } else {
+        offload = resolveAgyOffload(toolInput, policy, offloadTier, currentType, record, input.cwd);
+        offloadBackend = offload ? 'agy' : null;
+      }
+    }
+    if (offloadBackend === 'agy') {
+      const grant = issueAgyGrant({ ...offload, task: toolInput.prompt, sessionId: input.session_id });
+      // A relay without an immutable task/grant must never be spawned; retain
+      // the normal native route rather than hand it a forgeable preamble.
+      if (!grant) {
+        offload = null;
+        offloadBackend = null;
+      } else {
+        offload = { ...offload, grantId: grant.id, preamble: agyRelayPreamble(grant.id) };
+      }
+    }
     let effectiveTier = tier;
     if (offload) {
       // The relay agent itself only shells out and reads a file back, so it runs
@@ -193,7 +307,7 @@ async function main() {
         event: 'error',
         reason: 'routing produced a tier that is not in tierOrder',
         tier: effectiveTier, scored_tier: tier, rule,
-        offload: offload ? 'codex' : null,
+        offload: offloadBackend,
         session_id: input.session_id,
       }, policy.limits?.ledgerMaxBytes);
       return; // leave the spawn alone rather than emit a model that cannot run
@@ -227,12 +341,16 @@ async function main() {
       // it says what the work was worth, not what the courier cost.
       scored_tier: offload ? offloadTier : tier,
       redirect_to: redirectTo,
-      offload: offload ? 'codex' : null,
+      offload: offloadBackend,
+      offload_pool: offloadBackend === 'agy' ? offload.pool : null,
       offload_model: offload?.model ?? null,
-      offload_effort: offload?.effort ?? null,
+      offload_effort: offloadBackend === 'codex' ? offload?.effort ?? null : null,
       offload_via: offload?.via ?? null,
+      agy_cwd_rejected: agyCwdRejected,
       rule: offload
-        ? `${offloadRule}+offload:codex/${offload.model}`
+        ? (offloadBackend === 'agy'
+          ? `${offloadRule}+offload:agy/${offload.pool}/${offload.model}`
+          : `${offloadRule}+offload:codex/${offload.model}`)
         : (redirectTo ? `${rule}+redirect:${redirectTo}` : rule),
       changed,
     }, policy.limits?.ledgerMaxBytes);
@@ -266,7 +384,9 @@ async function main() {
         hookEventName: 'PreToolUse',
         permissionDecision: 'allow',
         permissionDecisionReason: offload
-          ? `model-policy: offload to codex ${offload.model} (effort ${offload.effort}, scored ${offloadTier}, ${offloadRule})`
+          ? (offloadBackend === 'agy'
+            ? `model-policy: offload to agy ${offload.pool}/${offload.model} (scored ${offloadTier}, ${offloadRule})`
+            : `model-policy: offload to codex ${offload.model} (effort ${offload.effort}, scored ${offloadTier}, ${offloadRule})`)
           : (redirectTo
             ? `model-policy: ${effectiveTier} via ${redirectTo} (${rule})`
             : `model-policy: ${effectiveTier} (${rule})`),
@@ -406,4 +526,7 @@ async function main() {
   }
 }
 
-main().catch(() => { /* fail open */ });
+main().catch(() => {
+  if (agyFallbackRelay) denyAgyOnFailure();
+  // All other hooks retain the normal fail-open behaviour.
+});

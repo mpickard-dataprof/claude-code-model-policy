@@ -93,7 +93,7 @@ for d in "$HOME"/.claude*; do
   ' "$d/settings.json" "$DRY" "$SHARED_DIR" "$ALL")"
 
   LINKS=0
-  for l in "$d/skills/model-policy-tune" "$d/agents/scout.md" "$d/agents/worker.md"; do
+  for l in "$d/skills/model-policy-tune" "$d/agents/scout.md" "$d/agents/worker.md" "$d/agents/codex.md" "$d/agents/agy.md"; do
     # Only remove links that point into THIS install. A user's own file of the same
     # name must survive an uninstall untouched.
     if [ -L "$l" ]; then

@@ -21,7 +21,35 @@ if [ -z "$NODE" ]; then
     [ -x "$c" ] && { NODE="$c"; break; }
   done
 fi
-[ -z "$NODE" ] && { echo "no usable node found"; exit 1; }
+if [ -z "$NODE" ]; then
+  # A missing Node launcher makes hooks fail open. When agy is otherwise live,
+  # calling that a warning would falsely report an enabled offload as verified.
+  AGY_READY="$(python3 - "$ROOT/policy.json" <<'PY' 2>/dev/null || true
+import json,os,sys
+try:
+ a=json.load(open(sys.argv[1])).get('agy') or {}
+ binary=str(a.get('binary') or '$HOME/.local/bin/agy').replace('$HOME',os.path.expanduser('~'))
+ bwrap=str((a.get('sandbox') or {}).get('bwrap') or '/usr/bin/bwrap')
+ print('yes' if a.get('enabled') is True and os.access(binary,os.X_OK) and os.access(bwrap,os.X_OK) else 'no')
+except Exception: print('no')
+PY
+)"
+  if [ "$AGY_READY" = yes ]; then
+    echo "FAIL: Antigravity is enabled and available, but node is missing so its hook cannot run"
+  else
+    echo "no usable node found"
+  fi
+  exit 1
+fi
+
+# Antigravity deliberately has an absolute configured binary: /usr/local/bin/agy
+# is an unrelated desktop launcher. Missing it is a capability warning, not a
+# policy failure — native routing remains safe.
+AGY_BIN="$("$NODE" -e 'try { const a=require(process.argv[1]).agy||{}; process.stdout.write(a.binary||"$HOME/.local/bin/agy"); } catch {}' "$ROOT/policy.json" 2>/dev/null)"
+case "$AGY_BIN" in '$HOME'/*) AGY_BIN="$HOME/${AGY_BIN#\$HOME/}" ;; esac
+if [ -n "$AGY_BIN" ] && [ ! -x "$AGY_BIN" ]; then
+  echo "warning: Antigravity binary is not executable: $AGY_BIN"
+fi
 
 "$NODE" -e '
 const fs = require("fs"), path = require("path");

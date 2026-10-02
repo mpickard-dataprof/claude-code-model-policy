@@ -3,12 +3,13 @@
 // in here throws on malformed input.
 
 import {
-  readFileSync, writeFileSync, appendFileSync, statSync, renameSync,
-  mkdirSync, readdirSync, unlinkSync, openSync, readSync, closeSync,
+  readFileSync, writeFileSync, appendFileSync, statSync, accessSync, constants, renameSync,
+  mkdirSync, readdirSync, unlinkSync, openSync, readSync, closeSync, realpathSync, chmodSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 export const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -24,6 +25,17 @@ export const POLICY_PATH = process.env.MODEL_POLICY_POLICY || join(ROOT, 'policy
 // routine `bash test.sh`.
 export const LEDGER_PATH = process.env.MODEL_POLICY_LEDGER || join(ROOT, 'ledger.jsonl');
 export const SESSIONS_DIR = process.env.MODEL_POLICY_SESSIONS || join(ROOT, 'sessions');
+export const AGY_GRANTS_DIR = process.env.MODEL_POLICY_GRANTS || join(ROOT, 'grants');
+export function usageSnapshotPath() {
+  if (process.env.MODEL_POLICY_USAGE_SNAPSHOT) return process.env.MODEL_POLICY_USAGE_SNAPSHOT;
+  try {
+    const config = process.env.CLAUDE_CONFIG_DIR || join(process.env.HOME || homedir(), '.claude');
+    return join(ROOT, `usage-${createHash('sha1').update(realpathSync(config)).digest('hex').slice(0, 12)}.json`);
+  } catch {
+    return join(ROOT, 'usage-unavailable.json'); // an absent config cannot spill
+  }
+}
+export const USAGE_SNAPSHOT_PATH = usageSnapshotPath();
 
 const DEFAULT_TIER_ORDER = ['haiku', 'sonnet', 'opus', 'fable'];
 
@@ -68,6 +80,33 @@ export function loadPolicy() {
     return p;
   } catch {
     return null; // invalid or missing policy -> caller leaves the model unset
+  }
+}
+
+/**
+ * Whether the Antigravity binary configured for this install was executable at
+ * SessionStart. This deliberately does not search PATH: the wrapper and policy
+ * name one binary, so routing to a different incidental executable would make
+ * one machine behave unlike another. The answer is persisted in session state
+ * and must not be recomputed by the gate mid-session.
+ */
+export function agyBinaryAvailable(policy) {
+  try {
+    const configured = policy?.agy?.binary;
+    if (typeof configured !== 'string' || !configured) return false;
+    const home = process.env.HOME || homedir();
+    const binary = configured.replace(/\$HOME(?=\/|$)/g, home);
+    const st = statSync(binary);
+    if (!st.isFile()) return false;
+    accessSync(binary, constants.X_OK);
+    const bwrap = policy?.agy?.sandbox?.bwrap || '/usr/bin/bwrap';
+    if (typeof bwrap !== 'string' || !bwrap.startsWith('/')) return false;
+    const sandbox = statSync(bwrap);
+    if (!sandbox.isFile()) return false;
+    accessSync(bwrap, constants.X_OK);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -264,6 +303,66 @@ export function resolveTier(toolInput, policy, sessionTier) {
  * fingerprint stripper so the two can never drift apart.
  */
 export const CODEX_TASK_MARKER = '--- CODEX-TASK-BEGINS (send only what follows) ---';
+export const AGY_TASK_MARKER = '--- AGY-TASK-BEGINS (send only what follows) ---';
+
+/** Read a fresh status-line usage snapshot, or null when it cannot safely spill. */
+export function usageSnapshot(policy) {
+  try {
+    const spill = policy?.agy?.usageSpill || {};
+    if (spill.enabled !== true) return null;
+    const snap = JSON.parse(readFileSync(USAGE_SNAPSHOT_PATH, 'utf8'));
+    const now = Number(process.env.MODEL_POLICY_NOW || Math.floor(Date.now() / 1000));
+    if (!Number.isFinite(now) || !Number.isFinite(snap?.ts)
+      || snap.ts > now || now - snap.ts > (spill.maxAgeSec ?? 600)) return null;
+    const valid = (n) => typeof n === 'number' && Number.isFinite(n) && n >= 0 && n <= 100;
+    const five = snap.five_hour_pct;
+    const seven = snap.seven_day_pct;
+    const overFive = valid(five) && five >= Number(spill.fiveHourPct ?? Infinity);
+    const overSeven = valid(seven) && seven >= Number(spill.sevenDayPct ?? Infinity);
+    return overFive || overSeven ? snap : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The explicit tag named by a description, in the fixed backend precedence order. */
+export function offloadTag(desc, policy) {
+  const text = String(desc ?? '');
+  const cx = policy?.overrides?.codexTag || '[gpt]';
+  const pools = policy?.agy?.pools || {};
+  if (text.includes(cx)) return 'codex';
+  if (text.includes(pools.thirdparty?.tag || '[agy]')) return 'agy:thirdparty';
+  if (text.includes(pools.gemini?.tag || '[gemini]')) return 'agy:gemini';
+  return null;
+}
+
+/** A cwd rebound over the home tmpfs would expose the user's secret-bearing home. */
+export function agyCwdAllowed(cwd) {
+  try {
+    const dir = realpathSync(typeof cwd === 'string' && cwd ? cwd : process.cwd());
+    const home = realpathSync(process.env.HOME || homedir());
+    // Reject shallow paths too. In particular, string-prefix logic turns
+    // `cwd + '/'` into `//` for '/', accidentally allowing the filesystem root.
+    const dirParts = dir.split('/').filter(Boolean);
+    const homeParts = home.split('/').filter(Boolean);
+    if (dir === '/' || dirParts.length < 2) return false;
+    // Component-prefix comparison is equivalent to commonpath([home, dir]) ===
+    // dir, without confusing /home/me with /home/meaningful.
+    if (dirParts.length <= homeParts.length
+      && dirParts.every((part, i) => homeParts[i] === part)) return false;
+    return !readdirSync(dir).some((name) => name === '.gemini' || name === '.ssh'
+      || name === '.claude' || name.startsWith('.claude'));
+  } catch { return false; }
+}
+
+function isWorktreeRoot(candidate) {
+  try {
+    const p = realpathSync(candidate);
+    if (!statSync(p).isDirectory() || dirname(dirname(p)) === p || dirname(p).split('/').pop() !== '.worktrees') return null;
+    const top = execFileSync('git', ['-C', p, 'rev-parse', '--show-toplevel'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    return realpathSync(top) === p ? p : null;
+  } catch { return null; }
+}
 
 export function resolveCodexOffload(toolInput, policy, tier, currentType, record) {
   const cx = policy.codex || {};
@@ -293,7 +392,7 @@ export function resolveCodexOffload(toolInput, policy, tier, currentType, record
   const desc = String(toolInput?.description ?? '');
   const tagged = typeof cx.tagFrom === 'string'
     ? desc.includes(cx.tagFrom)
-    : desc.includes(policy.overrides?.codexTag || '[gpt]');
+    : offloadTag(desc, policy) === 'codex';
 
   const never = Array.isArray(cx.neverAutoTiers) ? cx.neverAutoTiers : [];
   const auto = Array.isArray(cx.autoTiers) ? cx.autoTiers : [];
@@ -348,6 +447,106 @@ export function resolveCodexOffload(toolInput, policy, tier, currentType, record
     preamble,
     via: direct ? 'direct' : (tagged ? 'tag' : `auto:${tier}`),
   };
+}
+
+/** Resolve an Antigravity offload after the shared task tier has been scored. */
+export function resolveAgyOffload(toolInput, policy, tier, currentType, record, cwd) {
+  const agy = policy.agy || {};
+  if (agy.enabled !== true || (Object.hasOwn(agy, 'agent') && agy.agent !== 'agy')) return null;
+  // SessionStart checks the configured binary once. Older/recovered records have
+  // no field and therefore fail closed: their agent definitions may be loaded,
+  // but this machine's ability to execute Antigravity is unknown.
+  if (record?.agy_available !== true) return null;
+  const agent = 'agy';
+  const loaded = record?.via === 'sessionstart' && Array.isArray(record.agents);
+  if (!loaded || !record.agents.includes(agent)) return null;
+
+  const direct = String(currentType ?? '') === agent;
+  const types = Array.isArray(agy.offloadableTypes) ? agy.offloadableTypes : [];
+  if (!direct && !types.includes(String(currentType ?? ''))) return null;
+
+  const tagged = offloadTag(toolInput?.description, policy);
+  let poolName = tagged?.startsWith('agy:') ? tagged.slice(4) : null;
+  let via = poolName ? 'tag' : null;
+  if (!poolName && direct) {
+    poolName = 'thirdparty';
+    via = 'direct';
+  }
+  if (!poolName && !tagged) {
+    const spill = agy.usageSpill || {};
+    const allowed = Array.isArray(spill.tiers) ? spill.tiers : [];
+    // An explicit model or tier tag is an intentional owner choice. Do not spill it.
+    const hasExplicitModel = typeof toolInput?.model === 'string' && toolInput.model.length > 0;
+    const tierTags = [policy?.overrides?.hardTag || '[hard]', policy?.overrides?.cheapTag || '[cheap]'];
+    const hasTierTag = tierTags.some((t) => String(toolInput?.description ?? '').includes(t));
+    if (!hasExplicitModel && !hasTierTag && allowed.includes(tier) && usageSnapshot(policy)) {
+      poolName = spill.pool;
+      via = 'auto:usage';
+    }
+  }
+  if (!poolName) return null;
+
+  const pool = (agy.pools || {})[poolName];
+  if (!pool || typeof pool !== 'object') return null;
+  const model = pool.byTier?.[tier];
+  if (typeof model !== 'string' || !model) return null;
+  const relayTier = availableTier(agy.relayTier || 'haiku', policy).tier;
+  const parentCwd = typeof cwd === 'string' && cwd ? cwd : process.cwd();
+  if (!agyCwdAllowed(parentCwd)) return null;
+  let access = 'read-only';
+  let grantCwd = parentCwd;
+  // Edits require an explicit, separately configurable owner acknowledgement,
+  // and are off unless policy sets agy.editEnabled (shipped false).
+  // Gemini is deliberately never eligible, even if it carries the edit tag.
+  const editTag = typeof agy.editTag === 'string' && agy.editTag ? agy.editTag : '[edit]';
+  if (agy.editEnabled === true && poolName === 'thirdparty' && (via === 'tag' || via === 'auto:usage')
+      && String(toolInput?.description ?? '').includes(editTag)) {
+    const paths = String(toolInput?.prompt ?? '').match(/\/(?:[^\s'"`\\<>;|&(){}\[\],]+)/g) || [];
+    if (paths.length === 1) {
+      try {
+        const candidate = isWorktreeRoot(paths[0].replace(/[.:!?]+$/, ''));
+        if (candidate) {
+          access = 'edit';
+          grantCwd = candidate;
+        }
+      } catch { /* malformed/nonexistent candidate remains read-only */ }
+    }
+  }
+  return { agent, pool: poolName, model, relayTier, access, cwd: grantCwd, via };
+}
+
+/** Create immutable task/grant files owned by this installation for one relay run. */
+export function issueAgyGrant({ pool, model, access, cwd, task, sessionId }) {
+  try {
+    if (!['gemini', 'thirdparty'].includes(pool) || !['read-only', 'edit'].includes(access)
+      || typeof model !== 'string' || !model || typeof task !== 'string' || !task) return null;
+    const grants = AGY_GRANTS_DIR;
+    mkdirSync(grants, { recursive: true, mode: 0o700 });
+    chmodSync(grants, 0o700);
+    const id = randomBytes(24).toString('hex');
+    const taskPath = join(grants, `${id}.task`);
+    const grantPath = join(grants, `${id}.json`);
+    writeFileSync(taskPath, task, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    const now = Date.now();
+    writeFileSync(grantPath, JSON.stringify({ pool, model, access, cwd, task_path: taskPath,
+      session_id: sessionId || null, created: new Date(now).toISOString(),
+      expires: new Date(now + 2 * 60 * 60 * 1000).toISOString() }) + '\n',
+    { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    return { id, taskPath, grantPath };
+  } catch { return null; }
+}
+
+export function agyRelayPreamble(grantId) {
+  const wrapper = join(ROOT, 'bin', 'agy-relay.sh');
+  return [
+    'AGY-OFFLOAD:',
+    `  grant: ${grantId}`,
+    `  wrapper: ${wrapper}`,
+    '',
+    'Run exactly `bash <wrapper> --grant <grant>` once. Then read output_file from its JSON',
+    'result and relay the output verbatim. Do not attempt the task yourself.',
+    '', AGY_TASK_MARKER, '',
+  ].join('\n');
 }
 
 /**
@@ -663,7 +862,7 @@ export function promptFingerprint(text) {
 }
 
 /**
- * Drop a CODEX-OFFLOAD preamble so a fingerprint describes the TASK.
+ * Drop an offload preamble so a fingerprint describes the TASK.
  *
  * The preamble runs well past 100 characters, and a fingerprint keeps only the
  * first 100 — so without this, every offloaded spawn sharing a model and effort
@@ -695,13 +894,16 @@ export function stripOffloadPreamble(text) {
   // space ("/Users/Matt Smith/...") failed to match, and the envelope then went
   // UNSTRIPPED — putting routing metadata back into every fingerprint, the exact
   // bug the anchor was added to fix.
-  const ENVELOPE = /^CODEX-OFFLOAD:\n {2}model: \S+\n {2}effort: \S+\n {2}wrapper: .+\n/;
-  if (!ENVELOPE.test(text)) return text;
+  const CODEX_ENVELOPE = /^CODEX-OFFLOAD:\n {2}model: \S+\n {2}effort: \S+\n {2}wrapper: .+\n/;
+  const AGY_ENVELOPE = /^AGY-OFFLOAD:\n {2}grant: [a-f0-9]+\n {2}wrapper: .+\n/;
+  const marker = CODEX_ENVELOPE.test(text) ? CODEX_TASK_MARKER
+    : (AGY_ENVELOPE.test(text) ? AGY_TASK_MARKER : null);
+  if (!marker) return text;
   // The marker must be a LINE of its own, not merely present somewhere: an
   // `indexOf` hit inside a sentence was enough to trigger a split.
-  const m = text.match(new RegExp('^' + CODEX_TASK_MARKER.replace(/[.*+?^${}()|[\]\\-]/g, '\\$&') + '$', 'm'));
+  const m = text.match(new RegExp('^' + marker.replace(/[.*+?^${}()|[\]\\-]/g, '\\$&') + '$', 'm'));
   if (!m || m.index === undefined) return text;
-  return text.slice(m.index + CODEX_TASK_MARKER.length);
+  return text.slice(m.index + marker.length);
 
   // Honest limit: this recognises the SHAPE the gate emits, so a caller who
   // reproduces those exact bytes is indistinguishable from a real envelope.

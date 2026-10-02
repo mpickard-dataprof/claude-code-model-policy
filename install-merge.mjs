@@ -19,7 +19,7 @@ const RUNNER = join(hooksDir, 'run.sh');
 // Each entry: [event, matcher | null, script]
 const WANTED = [
   ['SessionStart', null, join(hooksDir, 'brief.mjs')],
-  ['PreToolUse', 'Agent|Workflow', join(hooksDir, 'gate.mjs')],
+  ['PreToolUse', 'Agent|Workflow|Bash', join(hooksDir, 'gate.mjs')],
   ['SubagentStop', null, join(hooksDir, 'log.mjs')],
 ];
 
@@ -58,18 +58,24 @@ for (const [event, matcher, script] of WANTED) {
   // this installer (or hand-edited) is recognised and upgraded in place rather
   // than duplicated.
   let found = false;
-  for (const group of list) {
+  for (let gi = 0; gi < list.length; gi++) {
+    const group = list[gi];
     if (!Array.isArray(group?.hooks)) continue;
     for (const h of group.hooks) {
       if (typeof h?.command !== 'string' || !h.command.includes(script)) continue;
       found = true;
       if (h.command === command) { present++; } else { h.command = command; migrated++; }
-      // The matcher decides which tools the hook even sees. A stale one from an
-      // earlier version (or a hand edit) would leave the hook registered but
-      // never firing, so correct it alongside the command.
+      // Do not widen a group shared with a user's hook. Older installers rewrote
+      // the whole group's matcher, silently changing which calls that hook sees.
       const want = matcher ?? undefined;
       if ((group.matcher ?? undefined) !== want) {
-        if (want === undefined) delete group.matcher; else group.matcher = want;
+        const others = group.hooks.some((x) => x !== h && !String(x?.command || '').includes(script));
+        if (others) {
+          group.hooks = group.hooks.filter((x) => x !== h);
+          const entry = { hooks: [h] };
+          if (want !== undefined) entry.matcher = want;
+          list.push(entry);
+        } else if (want === undefined) delete group.matcher; else group.matcher = want;
         migrated++;
       }
     }

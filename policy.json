@@ -67,7 +67,8 @@
     "_comment2": "Offload tag. Sends the spawn to an OpenAI model via the Codex CLI instead",
     "_comment3": "of an Anthropic one. Authoritative like the other tags, and it wins over",
     "_comment4": "them: [gpt] [hard] means a hard task run on Codex's top model.",
-    "codexTag": "[gpt]"
+    "codexTag": "[gpt]",
+    "_comment5": "Offload precedence is [gpt] > [agy] > [gemini] when a description has more than one tag."
   },
 
   "redirect": {
@@ -132,6 +133,50 @@
     "_comment22": "just running them. Offloading them would trade money you are not spending",
     "_comment23": "for latency you would feel.",
     "neverAutoTiers": ["haiku"]
+  },
+
+  "agy": {
+    "_comment1": "Offload to Google Antigravity through ~/.local/bin/agy, never the unrelated /usr/local/bin desktop launcher.",
+    "enabled": true,
+    "binary": "$HOME/.local/bin/agy",
+    "offloadableTypes": ["general-purpose", "claude", ""],
+    "relayTier": "haiku",
+    "editTag": "[edit]",
+    "_commentEdit": "[agy] [edit] is OFF: round-5 review found copy-back can leave a partial change set when a write fails mid-apply. Do not enable until that is fixed and re-reviewed.",
+    "editEnabled": false,
+    "sandbox": {
+      "_comment": "Linux bubblewrap is mandatory: agy is unavailable when this executable is absent.",
+      "bwrap": "/usr/bin/bwrap",
+      "hide": ["$HOME/.ssh", "$HOME/.gnupg", "$HOME/.aws", "$HOME/.claude*", "$HOME/.config", "$HOME/.local/share/keyrings", "$HOME/.docker", "$HOME/.kube", "$HOME/.netrc"]
+    },
+    "pools": {
+      "gemini": {
+        "tag": "[gemini]",
+        "byTier": {
+          "haiku": "gemini-3.8-flash-low",
+          "sonnet": "gemini-3.8-flash-medium",
+          "opus": "gemini-3.1-pro-high",
+          "fable": "gemini-3.1-pro-high"
+        }
+      },
+      "thirdparty": {
+        "tag": "[agy]",
+        "byTier": {
+          "haiku": "gpt-oss-120b-medium",
+          "sonnet": "claude-sonnet-4-6",
+          "opus": "claude-opus-4-6-thinking",
+          "fable": "claude-opus-4-6-thinking"
+        }
+      }
+    },
+    "usageSpill": {
+      "enabled": true,
+      "pool": "thirdparty",
+      "fiveHourPct": 80,
+      "sevenDayPct": 95,
+      "maxAgeSec": 600,
+      "tiers": ["sonnet", "opus"]
+    }
   },
 
   "workflow": {

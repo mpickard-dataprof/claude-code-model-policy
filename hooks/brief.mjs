@@ -9,7 +9,7 @@
 
 import {
   readStdin, parseJson, loadPolicy, normalizeModel, writeSessionTier, gcSessions,
-  availableAgents, emit,
+  availableAgents, agyBinaryAvailable, emit,
 } from './lib.mjs';
 
 /**
@@ -56,6 +56,36 @@ function codexBrief(policy) {
   ];
 }
 
+function agyBrief(policy, available) {
+  const agy = policy.agy || {};
+  if (agy.enabled === true && !available) {
+    const pools = agy.pools || {};
+    const gemini = pools.gemini?.tag || '[gemini]';
+    const thirdparty = pools.thirdparty?.tag || '[agy]';
+    return [`Antigravity tags \`${gemini}\` and \`${thirdparty}\` are inactive on this machine: they require the configured \`agy\` binary and Linux \`bwrap\` sandbox. Install agy with \`curl -fsSL https://antigravity.google/cli/install.sh | bash\`, install bubblewrap, then run \`agy\` once to sign in.`];
+  }
+  if (agy.enabled !== true || !agy.agent || !availableAgents().includes(agy.agent)) return [];
+  const pools = agy.pools || {};
+  const gemini = pools.gemini?.tag || '[gemini]';
+  const thirdparty = pools.thirdparty?.tag || '[agy]';
+  const spill = agy.usageSpill || {};
+  return [
+    '## Offloading to Antigravity models',
+    '',
+    `Tag a review with \`${gemini}\` to use Gemini. It is **reviews only** and always`,
+    'read-only. Tag a review or a self-contained worktree development task with',
+    `\`${thirdparty}\` to use the third-party pool. Development can edit only a named`,
+    '`.worktrees/` directory. Every run is in a mandatory Linux bubblewrap sandbox;',
+    'Gemini remains on probation: verify every result and run tests yourself afterwards.',
+    '',
+    `If more than one offload tag appears, precedence is \`${policy.overrides?.codexTag || '[gpt]'}\` > \`${thirdparty}\` > \`${gemini}\`.`,
+    spill.enabled === true
+      ? `When the local usage snapshot is fresh and either usage window is high, untagged ${Array.isArray(spill.tiers) ? spill.tiers.join('/') : 'sonnet/opus'} work spills to the ${spill.pool || 'thirdparty'} pool automatically.`
+      : 'Usage-window auto-spill is disabled; these tags are the only route in.',
+    '',
+  ];
+}
+
 async function main() {
   const input = parseJson(await readStdin());
   if (!input) return;
@@ -65,12 +95,15 @@ async function main() {
 
   // `model` is only present on SessionStart, and not guaranteed even there.
   const tier = normalizeModel(input.model);
+  const agyAvailable = agyBinaryAvailable(policy);
 
   // Record which agent definitions existed as this session started. Claude Code
   // reads the agents directory once at startup, so this is exactly the set the
   // session can actually spawn — the gate uses it to avoid redirecting to an
   // agent type that would fail with "Agent type not found".
-  writeSessionTier(input.session_id, tier, { via: 'sessionstart', agents: availableAgents() });
+  writeSessionTier(input.session_id, tier, {
+    via: 'sessionstart', agents: availableAgents(), agy_available: agyAvailable,
+  });
   gcSessions(policy.limits?.sessionTtlDays);
 
   const lines = Object.entries(policy.agentTypes || {})
@@ -104,6 +137,7 @@ async function main() {
     'path available, and generic spawns that score mechanical are redirected to it anyway.',
     '',
     ...codexBrief(policy),
+    ...agyBrief(policy, agyAvailable),
     '## Workflow scripts ARE auto-tiered — but say so when you know better',
     '',
     'An inline Workflow script is rewritten before it runs: every `agent()` call that',

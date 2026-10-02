@@ -188,7 +188,31 @@ across 202 persisted scripts. `nested > 0` invalidates that premise. When it app
 
 Do not silently fold these into the compliance percentage; they are unenforced spend.
 
-### 7. Propose the diff
+### 7. Offload backends on probation
+
+Gemini output is untrusted until it proves itself. This evaluation also applies to the `[agy]`
+third-party pool: do not treat either Antigravity pool as a trusted reviewer or test runner merely
+because its relay exited successfully.
+
+Read `$ROOT/tasks/gemini-track-record.md`, tolerating a missing file (report that there is no
+independent verification record rather than failing the audit). From `event: "route"` ledger rows
+with `offload: "agy"`, group dispatches by `offload_pool` and by task type inferred from the
+prompt fingerprint and description. Join outcomes using the same route/complete safeguards above;
+use independently verified track-record rows for `right?`, not a model's self-report.
+
+For every pool and task type, report:
+
+- dispatch count;
+- verified-right rate, including the number verified and unverified;
+- failures (`looks_failed`, a failed test result, or a documented verification failure).
+
+Recommend, with the supporting counts and failures, exactly one status per task type: **promote**
+(for example, Gemini as a counted reviewer or a test runner without spot-checks), **keep on
+probation**, or **demote**. Sparse or unverified evidence stays on probation. A promotion requires
+the owner's explicit OK; never apply it automatically. After that approval, record the promotion
+in `tasks/gemini-track-record.md`, and in `policy.json` too if it changes a policy setting.
+
+### 8. Propose the diff
 
 Show proposed `policy.json` changes as a diff, each line justified with its evidence
 (fire count, failure rate, token medians). Flag anything resting on fewer than ~10 samples as

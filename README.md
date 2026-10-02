@@ -131,6 +131,63 @@ Put a tag in the Agent task description to force a tier:
                               worker runs above the sonnet it declares)
 ```
 
+### Offload tags
+
+`[gpt]` sends a generic task through the Codex relay. `[gemini]` sends a
+**review only** task through Antigravity's Gemini pool and is always read-only.
+`[agy]` uses Antigravity's third-party pool. **Edit mode is shipped off**
+(`agy.editEnabled: false`), so both pools are read-only reviewers; see below. With it
+on, edits require both `[agy] [edit]` (the tag is configurable as `agy.editTag`) and
+one explicit path to a real `<repo>/.worktrees/<name>` Git-worktree root. The gate issues a single-use
+grant and the relay can run only that grant command. Every Antigravity run is
+inside a mandatory Linux `bwrap` sandbox; without bubblewrap the tags are inactive
+(including on macOS). Gemini is on probation: verify every result. If tags are combined, precedence is
+`[gpt]` > `[agy]` > `[gemini]`.
+
+The sandbox default-denies your home directory and rejects a cwd that is home, an
+ancestor of home, too shallow to safely mount, or contains `.claude*`, `.gemini`,
+or `.ssh`. Nothing else under `~/.gemini` (browser profile, other tools' history,
+account lists) is visible: each run gets a fresh, empty, throwaway
+`~/.gemini/antigravity-cli` with readonly copies of only agy's settings, OAuth token,
+install id and built-ins, so a run can neither read past conversations nor leave
+memory behind. It re-exposes the executable, granted checkout, checkout's shared Git
+metadata, and a task file (worker output is captured by the host supervisor, not
+mounted into the box). `/run` is never mounted. Network access is intentionally
+shared, so localhost and abstract Unix sockets remain a residual risk.
+
+This does not make an untrusted repository safe: the model can read every file in
+the repository under review (including secrets kept there) and it retains network
+access. The agy OAuth token is also readable inside the box so the CLI can work;
+a prompt-injected run could exfiltrate it. That exposure is inherent to this
+offload design—revoke it on the Google side with `agy logout` if needed.
+
+Why edit mode is off: the round-5 review found that copy-back is not transactional,
+so a write failing mid-apply (disk full, an unwritable directory) leaves part of a
+change set applied while the result says rejected. Do not set `agy.editEnabled`
+until that is fixed and re-reviewed; the wrapper also refuses edit grants while it
+is off. The design below is kept for that work.
+
+For edit runs, review the diff before running anything: edited tests, Makefiles,
+and package scripts run with your normal host permissions when you invoke them.
+For `[agy] [edit]`, Antigravity works in a private throwaway copy of the checkout.
+After it exits, the relay validates the complete delta before copying it back: only
+ordinary files with safe non-dot path components are eligible; agent instructions,
+`node_modules`, executable-bit changes, oversized changes, and host conflicts reject
+the whole delta. The result JSON reports every applied path (or the rejected rule).
+The sandbox also mitigates, but cannot eliminate, same-UID pathname races; an
+attacker already executing as your user is outside its threat model.
+
+Antigravity auto-spills untagged sonnet/opus tasks when the configured Claude
+usage threshold is reached. Add this one line to the status-line script that
+receives Claude Code's status JSON:
+
+```bash
+printf '%s' "$STATUS_JSON" | /absolute/path/to/model-policy/bin/usage-snapshot.sh
+```
+
+The helper silently writes a per-Claude-config `usage-<sha1>.json` beside the
+install and does nothing when rate-limit values are absent.
+
 ### Seeing what it did
 
 ```bash
@@ -274,7 +331,8 @@ gate counts these and warns instead. See [docs/DESIGN.md](docs/DESIGN.md).
 
 **nvm's node is invisible to hooks.** nvm only populates `PATH` in interactive shells, so
 `#!/usr/bin/env node` can silently never run. All hooks go through `hooks/run.sh`, which
-resolves node explicitly.
+resolves node explicitly. If Antigravity is enabled and otherwise available but Node
+is missing, `verify.sh` fails: its routing hook cannot run.
 
 ---
 
@@ -284,7 +342,7 @@ resolves node explicitly.
 hooks/
   run.sh      launcher; resolves node explicitly
   brief.mjs   SessionStart  — record session model, brief Claude on the tiers
-  gate.mjs    PreToolUse    — set the model on Agent spawns; rewrite Workflow scripts
+  gate.mjs    PreToolUse    — route Agent/Workflow calls; lock down agy relay tools and grants
   log.mjs     SubagentStop  — record real token usage, outcome, and actual model
   lib.mjs     tier resolution, clamps, script rewriting, ledger
 agents/       scout.md, worker.md, architect.md — model + effort together

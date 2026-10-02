@@ -34,6 +34,29 @@ import time
 GRACE_SECONDS = 5
 
 
+def safe_regular_open(path, flags, mode=0o600):
+    """Open a regular file without following a same-UID planted symlink."""
+    fd = os.open(path, flags | os.O_NOFOLLOW, mode)
+    try:
+        if not __import__('stat').S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("not a regular file")
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def safe_regular_size(path):
+    try:
+        fd = safe_regular_open(path, os.O_RDONLY)
+        try:
+            return os.fstat(fd).st_size
+        finally:
+            os.close(fd)
+    except Exception:
+        return 0
+
+
 def emit(**kw):
     """The ONE emission path. Reached AT MOST ONCE per invocation.
 
@@ -80,8 +103,35 @@ def group_members(pgid):
 
 
 def main():
-    (timeout_s, out_path, err_path, stdout_path, task_path,
-     sandbox, model, effort, cwd) = sys.argv[1:10]
+    # The legacy positional form is deliberately unchanged for Codex. The
+    # command form lets another wrapper reuse this process-group owner without
+    # copying its deadline and teardown logic.
+    generic = len(sys.argv) > 1 and sys.argv[1] == "--command"
+    if generic:
+        try:
+            cut = sys.argv.index("--", 2)
+            (timeout_s, out_path, err_path, stdout_path, task_path,
+             model, cwd) = sys.argv[2:cut]
+            argv = sys.argv[cut + 1:]
+        except Exception:
+            emit(reason="invalid generic supervisor arguments", exit_code=2)
+            return 2
+        sandbox = None
+        effort = None
+        worker_name = os.path.basename(argv[0]) if argv else "worker"
+        if not argv:
+            emit(reason="no worker command given", exit_code=2, model=model)
+            return 2
+    else:
+        (timeout_s, out_path, err_path, stdout_path, task_path,
+         sandbox, model, effort, cwd) = sys.argv[1:10]
+        argv = [
+            "codex", "exec", "--skip-git-repo-check",
+            "-C", cwd, "-s", sandbox, "-m", model,
+            "-c", "model_reasoning_effort=%s" % effort,
+            "-o", out_path, "-",
+        ]
+        worker_name = "codex"
     timeout_s = int(timeout_s)
     started = time.time()
 
@@ -102,17 +152,10 @@ def main():
         except Exception:
             pass
 
-    argv = [
-        "codex", "exec", "--skip-git-repo-check",
-        "-C", cwd, "-s", sandbox, "-m", model,
-        "-c", "model_reasoning_effort=%s" % effort,
-        "-o", out_path, "-",
-    ]
-
     try:
         fin = open(task_path, "rb")
-        fout = open(stdout_path, "wb")
-        ferr = open(err_path, "wb")
+        fout = os.fdopen(safe_regular_open(stdout_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC), "wb")
+        ferr = os.fdopen(safe_regular_open(err_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC), "wb")
     except Exception as exc:
         emit(reason="could not open worker io: %s" % exc, exit_code=2,
              model=model, effort=effort, sandbox=sandbox)
@@ -120,13 +163,14 @@ def main():
 
     try:
         proc = subprocess.Popen(argv, stdin=fin, stdout=fout, stderr=ferr,
-                                start_new_session=True)
+                                start_new_session=True, cwd=(cwd if generic else None))
     except FileNotFoundError:
-        emit(reason="codex CLI not found on PATH", exit_code=2,
+        emit(reason=("%s CLI not found" % worker_name) if generic
+             else "codex CLI not found on PATH", exit_code=2,
              model=model, effort=effort, sandbox=sandbox)
         return 2
     except Exception as exc:
-        emit(reason="could not start codex: %s" % exc, exit_code=2,
+        emit(reason="could not start %s: %s" % (worker_name, exc), exit_code=2,
              model=model, effort=effort, sandbox=sandbox)
         return 2
 
@@ -220,7 +264,7 @@ def main():
     elapsed = int(time.time() - started)
     nbytes = 0
     try:
-        nbytes = os.path.getsize(out_path)
+        nbytes = safe_regular_size(out_path)
     except Exception:
         pass
 
@@ -233,9 +277,9 @@ def main():
     elif code is None:
         ok, reason = False, "worker did not exit and could not be reaped"
     elif code != 0:
-        ok, reason = False, "codex exited %d" % code
+        ok, reason = False, "%s exited %d" % (worker_name, code)
     elif nbytes == 0:
-        ok, reason = False, "codex produced no output"
+        ok, reason = False, "%s produced no output" % worker_name
     else:
         ok, reason = True, None
 
@@ -265,7 +309,7 @@ def main():
             # Seek, do not slurp. A noisy failing worker can write a very large
             # stderr log, and reading all of it to keep 600 characters put the
             # memory pressure exactly where the failure report was needed.
-            with open(err_path, "rb") as fh:
+            with os.fdopen(safe_regular_open(err_path, os.O_RDONLY), "rb") as fh:
                 fh.seek(0, os.SEEK_END)
                 fh.seek(max(0, fh.tell() - 4096))
                 # read(4096), not read(): a still-running logger appending after
