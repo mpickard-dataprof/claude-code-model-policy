@@ -9,7 +9,7 @@
 
 import {
   readStdin, parseJson, loadPolicy, normalizeModel, writeSessionTier, gcSessions,
-  availableAgents, emit,
+  availableAgents, agyBinaryAvailable, emit,
 } from './lib.mjs';
 
 /**
@@ -56,8 +56,14 @@ function codexBrief(policy) {
   ];
 }
 
-function agyBrief(policy) {
+function agyBrief(policy, available) {
   const agy = policy.agy || {};
+  if (agy.enabled === true && !available) {
+    const pools = agy.pools || {};
+    const gemini = pools.gemini?.tag || '[gemini]';
+    const thirdparty = pools.thirdparty?.tag || '[agy]';
+    return [`Antigravity tags \`${gemini}\` and \`${thirdparty}\` are inactive on this machine: install with \`curl -fsSL https://antigravity.google/cli/install.sh | bash\`, then run \`agy\` once to sign in.`];
+  }
   if (agy.enabled !== true || !agy.agent || !availableAgents().includes(agy.agent)) return [];
   const pools = agy.pools || {};
   const gemini = pools.gemini?.tag || '[gemini]';
@@ -88,12 +94,15 @@ async function main() {
 
   // `model` is only present on SessionStart, and not guaranteed even there.
   const tier = normalizeModel(input.model);
+  const agyAvailable = agyBinaryAvailable(policy);
 
   // Record which agent definitions existed as this session started. Claude Code
   // reads the agents directory once at startup, so this is exactly the set the
   // session can actually spawn — the gate uses it to avoid redirecting to an
   // agent type that would fail with "Agent type not found".
-  writeSessionTier(input.session_id, tier, { via: 'sessionstart', agents: availableAgents() });
+  writeSessionTier(input.session_id, tier, {
+    via: 'sessionstart', agents: availableAgents(), agy_available: agyAvailable,
+  });
   gcSessions(policy.limits?.sessionTtlDays);
 
   const lines = Object.entries(policy.agentTypes || {})
@@ -127,7 +136,7 @@ async function main() {
     'path available, and generic spawns that score mechanical are redirected to it anyway.',
     '',
     ...codexBrief(policy),
-    ...agyBrief(policy),
+    ...agyBrief(policy, agyAvailable),
     '## Workflow scripts ARE auto-tiered — but say so when you know better',
     '',
     'An inline Workflow script is rewritten before it runs: every `agent()` call that',

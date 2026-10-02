@@ -68,7 +68,10 @@ async function main() {
         // record's provenance — overwriting `via`/`agents` here would silently
         // disable effort tiering for the rest of the session.
         const carried = record?.via === 'sessionstart' && Array.isArray(record.agents)
-          ? { via: 'sessionstart', agents: record.agents }
+          ? {
+            via: 'sessionstart', agents: record.agents,
+            ...(Object.hasOwn(record, 'agy_available') ? { agy_available: record.agy_available } : {}),
+          }
           : { via: 'transcript' };
         writeSessionTier(input.session_id, sessionTier, carried);
         record = { model: sessionTier, at: new Date().toISOString(), ...carried };
@@ -147,18 +150,21 @@ async function main() {
       });
       return;
     }
-    if (isAgyRelayType && agy.enabled !== true) {
+    if (isAgyRelayType && (agy.enabled !== true || record?.agy_available !== true)) {
       ledger({
         event: 'route', tool: 'Agent', session_id: input.session_id, tool_use_id: input.tool_use_id,
         agent_type: currentType, description: String(toolInput.description ?? '').slice(0, 120),
-        rule: 'deny:agy-disabled', denied: true,
+        rule: agy.enabled !== true ? 'deny:agy-disabled' : 'deny:agy-unavailable', denied: true,
       }, policy.limits?.ledgerMaxBytes);
       emit({
         hookSpecificOutput: {
           hookEventName: 'PreToolUse', permissionDecision: 'deny',
           permissionDecisionReason:
-            'model-policy: Antigravity offload is disabled (agy.enabled is not true), so the '
-            + `\`${agy.agent}\` relay agent cannot be spawned. Use a normal agent type.`,
+            agy.enabled !== true
+              ? 'model-policy: Antigravity offload is disabled (agy.enabled is not true), so the '
+                + `\`${agy.agent}\` relay agent cannot be spawned. Use a normal agent type.`
+              : 'model-policy: Antigravity is unavailable for this session, so the '
+                + `\`${agy.agent}\` relay agent cannot be spawned. Use a normal agent type.`,
         },
       });
       return;

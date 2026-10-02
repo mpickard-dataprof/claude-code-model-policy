@@ -3,7 +3,7 @@
 // in here throws on malformed input.
 
 import {
-  readFileSync, writeFileSync, appendFileSync, statSync, renameSync,
+  readFileSync, writeFileSync, appendFileSync, statSync, accessSync, constants, renameSync,
   mkdirSync, readdirSync, unlinkSync, openSync, readSync, closeSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -69,6 +69,28 @@ export function loadPolicy() {
     return p;
   } catch {
     return null; // invalid or missing policy -> caller leaves the model unset
+  }
+}
+
+/**
+ * Whether the Antigravity binary configured for this install was executable at
+ * SessionStart. This deliberately does not search PATH: the wrapper and policy
+ * name one binary, so routing to a different incidental executable would make
+ * one machine behave unlike another. The answer is persisted in session state
+ * and must not be recomputed by the gate mid-session.
+ */
+export function agyBinaryAvailable(policy) {
+  try {
+    const configured = policy?.agy?.binary;
+    if (typeof configured !== 'string' || !configured) return false;
+    const home = process.env.HOME || homedir();
+    const binary = configured.replace(/\$HOME(?=\/|$)/g, home);
+    const st = statSync(binary);
+    if (!st.isFile()) return false;
+    accessSync(binary, constants.X_OK);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -383,6 +405,10 @@ export function resolveCodexOffload(toolInput, policy, tier, currentType, record
 export function resolveAgyOffload(toolInput, policy, tier, currentType, record, cwd) {
   const agy = policy.agy || {};
   if (agy.enabled !== true) return null;
+  // SessionStart checks the configured binary once. Older/recovered records have
+  // no field and therefore fail closed: their agent definitions may be loaded,
+  // but this machine's ability to execute Antigravity is unknown.
+  if (record?.agy_available !== true) return null;
   const agent = typeof agy.agent === 'string' && agy.agent.length > 0 ? agy.agent : null;
   if (!agent) return null;
   const loaded = record?.via === 'sessionstart' && Array.isArray(record.agents);

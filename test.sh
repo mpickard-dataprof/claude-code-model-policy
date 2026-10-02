@@ -952,7 +952,7 @@ assert "explicit model still gets its tier's effort" "fable/medium" \
 echo
 echo "== Antigravity offload: routing, usage spill and wrapper guards =="
 S_AGY="test-session-agy"
-printf '{"model":"opus","via":"sessionstart","agents":["scout","worker","architect","codex","agy"]}' > "$SESS/$S_AGY.json"
+printf '{"model":"opus","via":"sessionstart","agents":["scout","worker","architect","codex","agy"],"agy_available":true}' > "$SESS/$S_AGY.json"
 AGYTAG='"subagent_type":"general-purpose","description":"[agy] review the parser","prompt":"review the parser for correctness"'
 GEMTAG='"subagent_type":"general-purpose","description":"[gemini] review the parser","prompt":"review the parser for correctness"'
 redirect "[agy] swaps the type for the relay" agy "$(agent $S_AGY "$AGYTAG")"
@@ -974,6 +974,17 @@ grepfield "[agy] wins over Gemini" prompt "pool: thirdparty" "$(agent $S_AGY '"s
 redirect "agy leaves specialised built-ins alone" Explore "$(agent $S_AGY '"subagent_type":"Explore","description":"[agy] review","prompt":"find it"')"
 redirect "agy requires its relay at SessionStart" scout "$(agent $SESSION_READY '"subagent_type":"general-purpose","description":"[agy] find","prompt":"find it"')"
 
+# Availability is decided by SessionStart, not by the gate. A record from before
+# that field existed must fail closed even if it knows the relay definition.
+S_AGY_OLD="test-session-agy-old"
+printf '{"model":"opus","via":"sessionstart","agents":["scout","worker","architect","codex","agy"]}' > "$SESS/$S_AGY_OLD.json"
+redirect "missing agy availability leaves [agy] native" general-purpose "$(agent $S_AGY_OLD "$AGYTAG")"
+redirect "missing agy availability leaves [gemini] native" general-purpose "$(agent $S_AGY_OLD "$GEMTAG")"
+assert "missing agy availability adds no relay preamble" no \
+  "$(printf '%s' "$(agent $S_AGY_OLD "$AGYTAG")" | sh "$RUN" "$GATE" 2>/dev/null | grep -q 'AGY-OFFLOAD:' && echo yes || echo no)"
+check "missing agy availability denies direct relay" DENY \
+  "$(agent $S_AGY_OLD '"subagent_type":"agy","description":"direct","prompt":"review the parser"')"
+
 # The snapshot and clock are both injected: tests never touch a real install's
 # usage.json and do not depend on wall time.
 USAGE="$SANDBOX/usage.json"
@@ -985,9 +996,9 @@ auto_agent() { # <snapshot-json-or-empty> <description> <prompt>
 }
 # `agent` above emits its own JSON only when piped through the gate, so build these
 # payloads directly for the snapshot cases.
-spill() { # <snapshot-json-or-empty> <description> <prompt>
+spill() { # <snapshot-json-or-empty> <description> <prompt> [session]
   [ -n "$1" ] && printf '%s' "$1" > "$USAGE" || rm -f "$USAGE"
-  "$NODE" -e 'process.stdout.write(JSON.stringify({session_id:process.argv[1],tool_use_id:"u",hook_event_name:"PreToolUse",tool_name:"Agent",tool_input:{subagent_type:"general-purpose",description:process.argv[2],prompt:process.argv[3]}}))' "$S_AGY" "$2" "$3" \
+  "$NODE" -e 'process.stdout.write(JSON.stringify({session_id:process.argv[1],tool_use_id:"u",hook_event_name:"PreToolUse",tool_name:"Agent",tool_input:{subagent_type:"general-purpose",description:process.argv[2],prompt:process.argv[3]}}))' "${4:-$S_AGY}" "$2" "$3" \
     | env MODEL_POLICY_USAGE_SNAPSHOT="$USAGE" MODEL_POLICY_NOW=1000 sh "$RUN" "$GATE" 2>/dev/null \
     | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).hookSpecificOutput.updatedInput.subagent_type)}catch{process.stdout.write("NOOP")}})'
 }
@@ -997,6 +1008,8 @@ assert "stale usage does not spill" general-purpose "$(spill '{"five_hour_pct":9
 assert "missing usage does not spill" general-purpose "$(spill '' "review" "review the parser")"
 assert "below threshold does not spill" general-purpose "$(spill '{"five_hour_pct":79,"seven_day_pct":94,"ts":999}' "review" "review the parser")"
 assert "explicit Gemini tag beats usage spill" agy "$(spill '{"five_hour_pct":99,"ts":999}' "[gemini] review" "review the parser")"
+assert "missing agy availability never usage-spills" general-purpose \
+  "$(spill '{"five_hour_pct":99,"ts":999}' "review" "review the parser" "$S_AGY_OLD")"
 printf '%s' "$(agent $S_AGY "$AGYTAG")" | sh "$RUN" "$GATE" >/dev/null 2>&1
 assert "agy ledger records pool and tag route" thirdparty/tag \
   "$("$NODE" -e 'const l=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n").map(JSON.parse);const r=l.filter(x=>x.offload==="agy").pop();process.stdout.write((r?.offload_pool||"")+"/"+(r?.offload_via||""))' "$LEDG")"
@@ -1013,6 +1026,30 @@ printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\\n" "$@" > "${AGY_ARGV_LOG:-/dev
 chmod +x "$FAKE_AGY"
 AGY_POLICY="$SANDBOX/agy-policy.json"
 "$NODE" -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));p.agy.binary=process.argv[2];fs.writeFileSync(process.argv[3],JSON.stringify(p));' "$DIR/policy.json" "$FAKE_AGY" "$AGY_POLICY"
+
+# The SessionStart check resolves $HOME once and records the result. The gate
+# consumes only that state, so a legacy record cannot accidentally route because
+# a binary appears later in the session.
+MISSING_AGY_POLICY="$SANDBOX/agy-missing-policy.json"
+"$NODE" -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));p.agy.binary="$HOME/bin/missing-agy";fs.writeFileSync(process.argv[2],JSON.stringify(p));' "$DIR/policy.json" "$MISSING_AGY_POLICY"
+S_AGY_MISSING="test-session-agy-missing"
+BRIEF_OUT="$(printf '{"session_id":"%s","model":"opus"}' "$S_AGY_MISSING" | env HOME="$SANDBOX/agy-home" MODEL_POLICY_POLICY="$MISSING_AGY_POLICY" sh "$RUN" "$DIR/hooks/brief.mjs" 2>/dev/null)"
+assert "SessionStart records missing $HOME agy unavailable" false \
+  "$("$NODE" -e 'process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).agy_available))' "$SESS/$S_AGY_MISSING.json")"
+assert "missing agy brief says tags are inactive" yes \
+  "$(printf '%s' "$BRIEF_OUT" | grep -q 'Antigravity tags.*inactive on this machine.*install.sh.*run.*agy.*sign in' && echo yes || echo no)"
+assert "missing agy brief omits full offload brief" no \
+  "$(printf '%s' "$BRIEF_OUT" | grep -q '## Offloading to Antigravity models' && echo yes || echo no)"
+S_AGY_FAKE="test-session-agy-fake"
+AGY_AGENT_DIR="$SANDBOX/agy-agents"; mkdir -p "$AGY_AGENT_DIR"
+printf -- '---\nname: agy\n---\n' > "$AGY_AGENT_DIR/agy.md"
+printf '{"session_id":"%s","model":"opus"}' "$S_AGY_FAKE" \
+  | env MODEL_POLICY_POLICY="$AGY_POLICY" MODEL_POLICY_AGENT_DIRS="$AGY_AGENT_DIR" sh "$RUN" "$DIR/hooks/brief.mjs" >/dev/null 2>&1
+assert "SessionStart records executable fake agy available" true \
+  "$("$NODE" -e 'process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).agy_available))' "$SESS/$S_AGY_FAKE.json")"
+FAKE_AGY_ROUTE="$(printf '%s' "$(agent $S_AGY_FAKE "$AGYTAG")" | env MODEL_POLICY_POLICY="$AGY_POLICY" sh "$RUN" "$GATE" 2>/dev/null)"
+assert "SessionStart availability enables fake agy routing" agy \
+  "$(printf '%s' "$FAKE_AGY_ROUTE" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).hookSpecificOutput.updatedInput.subagent_type)}catch{process.stdout.write("NOOP")}})')"
 AGY_TASK="$SANDBOX/agy-task.md"; printf 'review this\n' > "$AGY_TASK"
 AGY_LOG="$SANDBOX/agy-argv.log"
 agy_wrap() { env MODEL_POLICY_POLICY="$AGY_POLICY" AGY_ARGV_LOG="$AGY_LOG" bash "$DIR/bin/agy-relay.sh" "$@" 2>&1; }
@@ -1041,7 +1078,8 @@ assert "usage snapshot helper stays silent" "" "$(printf '%s' '{"rate_limits":{}
 assert "usage snapshot helper writes rate-limit data" 81 \
   "$("$NODE" -e 'const p=require(process.argv[1]);process.stdout.write(String(p.five_hour_pct))' "$SNAP_OUT" 2>/dev/null)"
 
-rm -f "$SESS/$S_AGY.json" "$SESS/$S_AGY.events"
+rm -f "$SESS/$S_AGY.json" "$SESS/$S_AGY.events" "$SESS/$S_AGY_OLD.json" "$SESS/$S_AGY_OLD.events" \
+  "$SESS/$S_AGY_MISSING.json" "$SESS/$S_AGY_MISSING.events" "$SESS/$S_AGY_FAKE.json" "$SESS/$S_AGY_FAKE.events"
 rm -f "$SESS/$S_CX.json" "$SESS/$S_CX.events"
 rm -f "$SESS/$SESSION_OK.json" "$SESS/$SESSION_READY.json" "$SESS/$SESSION_LEGACY.json"
 echo
