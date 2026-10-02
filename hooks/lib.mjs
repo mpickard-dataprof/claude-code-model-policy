@@ -9,6 +9,7 @@ import {
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash, randomBytes } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 export const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -335,6 +336,27 @@ export function offloadTag(desc, policy) {
   return null;
 }
 
+/** A cwd rebound over the home tmpfs would expose the user's secret-bearing home. */
+export function agyCwdAllowed(cwd) {
+  try {
+    const dir = realpathSync(typeof cwd === 'string' && cwd ? cwd : process.cwd());
+    const home = realpathSync(process.env.HOME || homedir());
+    // Includes $HOME itself and every ancestor of it.
+    if (home === dir || home.startsWith(`${dir}/`)) return false;
+    return !readdirSync(dir).some((name) => name === '.gemini' || name === '.ssh'
+      || name === '.claude' || name.startsWith('.claude'));
+  } catch { return false; }
+}
+
+function isWorktreeRoot(candidate) {
+  try {
+    const p = realpathSync(candidate);
+    if (!statSync(p).isDirectory() || dirname(dirname(p)) === p || dirname(p).split('/').pop() !== '.worktrees') return null;
+    const top = execFileSync('git', ['-C', p, 'rev-parse', '--show-toplevel'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    return realpathSync(top) === p ? p : null;
+  } catch { return null; }
+}
+
 export function resolveCodexOffload(toolInput, policy, tier, currentType, record) {
   const cx = policy.codex || {};
   // Strictly boolean true, matching the gate and the wrapper. A string "false"
@@ -464,15 +486,19 @@ export function resolveAgyOffload(toolInput, policy, tier, currentType, record, 
   if (typeof model !== 'string' || !model) return null;
   const relayTier = availableTier(agy.relayTier || 'haiku', policy).tier;
   const parentCwd = typeof cwd === 'string' && cwd ? cwd : process.cwd();
+  if (!agyCwdAllowed(parentCwd)) return null;
   let access = 'read-only';
   let grantCwd = parentCwd;
-  // Only an explicit [agy] tag or a usage spill may request edit capability.
-  if (poolName === 'thirdparty' && (via === 'tag' || via === 'auto:usage')) {
+  // Edits require an explicit, separately configurable owner acknowledgement.
+  // Gemini is deliberately never eligible, even if it carries the edit tag.
+  const editTag = typeof agy.editTag === 'string' && agy.editTag ? agy.editTag : '[edit]';
+  if (poolName === 'thirdparty' && (via === 'tag' || via === 'auto:usage')
+      && String(toolInput?.description ?? '').includes(editTag)) {
     const paths = String(toolInput?.prompt ?? '').match(/\/(?:[^\s'"`\\<>;|&(){}\[\],]+)/g) || [];
     if (paths.length === 1) {
       try {
-        const candidate = realpathSync(paths[0].replace(/[.:!?]+$/, ''));
-        if (statSync(candidate).isDirectory() && candidate.split('/').includes('.worktrees')) {
+        const candidate = isWorktreeRoot(paths[0].replace(/[.:!?]+$/, ''));
+        if (candidate) {
           access = 'edit';
           grantCwd = candidate;
         }

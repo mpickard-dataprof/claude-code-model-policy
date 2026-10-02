@@ -1,8 +1,8 @@
 ---
 name: agy
-description: Offload agent. Hands tasks to Google Antigravity and relays the result verbatim. `[gemini]` is reviews only; `[agy]` can edit only a named worktree.
-tools: Bash, Read
-disallowedTools: Write, Edit, NotebookEdit
+description: Offload agent. Hands tasks to Google Antigravity and relays the result verbatim. `[gemini]` is reviews only; `[agy] [edit]` can edit only a named worktree.
+tools: Bash
+disallowedTools: Read, Glob, Grep, WebFetch, WebSearch, Write, Edit, NotebookEdit
 model: haiku
 effort: low
 color: green
@@ -25,8 +25,10 @@ Your prompt begins with an `AGY-OFFLOAD:` block. Read only `grant:` and
 bash <wrapper> --grant <grant>
 ```
 
-The wrapper emits one JSON line. On `ok: true`, Read `output_file` and relay it
-verbatim. The result supplies pool/model metadata; do not invent any.
+The wrapper emits one JSON line, then `--- AGY-ANSWER ---`, then the answer.
+On `ok: true`, relay everything after that marker verbatim. The answer is capped
+at 200 KiB; `truncated:true` in the JSON means the wrapper appended a notice.
+The result supplies pool/model metadata; do not invent any.
 
 When `ok` is false, stop and report `OFFLOAD FAILED:`, quoting `reason` and
 `exit_code`. Do not retry (the grant is single-use) and do not do the task yourself.

@@ -135,18 +135,26 @@ Put a tag in the Agent task description to force a tier:
 
 `[gpt]` sends a generic task through the Codex relay. `[gemini]` sends a
 **review only** task through Antigravity's Gemini pool and is always read-only.
-`[agy]` uses Antigravity's third-party pool for reviews or development; edits are
-allowed only in a named `.worktrees/` directory. The gate issues a single-use
+`[agy]` uses Antigravity's third-party pool for reviews or development. Edits require
+both `[agy] [edit]` (the tag is configurable as `agy.editTag`) and one explicit path
+to a real `<repo>/.worktrees/<name>` Git-worktree root. The gate issues a single-use
 grant and the relay can run only that grant command. Every Antigravity run is
 inside a mandatory Linux `bwrap` sandbox; without bubblewrap the tags are inactive
 (including on macOS). Gemini is on probation: verify every result. If tags are combined, precedence is
 `[gpt]` > `[agy]` > `[gemini]`.
 
-The sandbox default-denies your home directory. It re-exposes only agy's own
-state, its executable, the granted checkout, the checkout's shared Git metadata,
-and private relay output. This does not make an untrusted repository safe: the
+The sandbox default-denies your home directory and rejects a cwd that is home, an
+ancestor of home, or contains `.claude*`, `.gemini`, or `.ssh`. Gemini configuration
+is read-only; only Antigravity CLI runtime state is writable. It re-exposes the
+executable, granted checkout, checkout's shared Git metadata, and private relay
+output. This does not make an untrusted repository safe: the
 model can read every file in the repository under review (including secrets kept
 there) and it retains network access, so it could exfiltrate that material.
+
+For edit runs, review the diff before running anything: edited tests, Makefiles,
+and package scripts run with your normal host permissions when you invoke them.
+The sandbox also mitigates, but cannot eliminate, same-UID pathname races; an
+attacker already executing as your user is outside its threat model.
 
 Antigravity auto-spills untagged sonnet/opus tasks when the configured Claude
 usage threshold is reached. Add this one line to the status-line script that
@@ -302,7 +310,8 @@ gate counts these and warns instead. See [docs/DESIGN.md](docs/DESIGN.md).
 
 **nvm's node is invisible to hooks.** nvm only populates `PATH` in interactive shells, so
 `#!/usr/bin/env node` can silently never run. All hooks go through `hooks/run.sh`, which
-resolves node explicitly.
+resolves node explicitly. If Antigravity is enabled and otherwise available but Node
+is missing, `verify.sh` fails: its routing hook cannot run.
 
 ---
 
@@ -312,7 +321,7 @@ resolves node explicitly.
 hooks/
   run.sh      launcher; resolves node explicitly
   brief.mjs   SessionStart  — record session model, brief Claude on the tiers
-  gate.mjs    PreToolUse    — route Agent/Workflow calls; lock down agy relay Bash grants
+  gate.mjs    PreToolUse    — route Agent/Workflow calls; lock down agy relay tools and grants
   log.mjs     SubagentStop  — record real token usage, outcome, and actual model
   lib.mjs     tier resolution, clamps, script rewriting, ledger
 agents/       scout.md, worker.md, architect.md — model + effort together

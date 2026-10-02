@@ -8,7 +8,8 @@ POOL=""; MODEL=""; ACCESS=""; CWD=""
 emit() { python3 - "$@" <<'PY'
 import json,sys
 ok,code,reason=sys.argv[1],int(sys.argv[2]),sys.argv[3]
-print(json.dumps({'ok':ok=='true','exit_code':code,'reason':reason or None,'output_file':sys.argv[4] or None,'output_bytes':int(sys.argv[5] or 0),'pool':sys.argv[6] or None,'model':sys.argv[7] or None,'access':sys.argv[8] or None,'cwd':sys.argv[9] or None,'elapsed_s':int(sys.argv[10] or 0),'stderr_tail':sys.argv[11] or None,'teardown':'n/a: no worker was started'}))
+print(json.dumps({'ok':ok=='true','exit_code':code,'reason':reason or None,'output_file':sys.argv[4] or None,'output_bytes':int(sys.argv[5] or 0),'truncated':False,'pool':sys.argv[6] or None,'model':sys.argv[7] or None,'access':sys.argv[8] or None,'cwd':sys.argv[9] or None,'elapsed_s':int(sys.argv[10] or 0),'stderr_tail':sys.argv[11] or None,'teardown':'n/a: no worker was started'}))
+print('--- AGY-ANSWER ---')
 PY
 }
 fail() { emit false "${2:-2}" "$1" "" 0 "$POOL" "$MODEL" "$ACCESS" "$CWD" 0 ""; exit "${2:-2}"; }
@@ -20,7 +21,7 @@ case "$GRANT_ID" in *[!abcdef0123456789]*) fail invalid_grant_id ;; esac
 GRANTS="${MODEL_POLICY_GRANTS:-$ROOT/grants}"; GRANT="$GRANTS/$GRANT_ID.json"
 # Validate before consuming; os.replace makes a racing second caller see used.
 GRANT_DATA="$(python3 - "$GRANT" "$GRANTS" "$POLICY" <<'PY'
-import json,os,sys,time
+import json,os,sys,time,subprocess,stat
 from datetime import datetime
 p,grants,policy_path=sys.argv[1:]
 def die(r): print(json.dumps({'error':r})); raise SystemExit
@@ -35,7 +36,21 @@ if g['pool'] not in ('gemini','thirdparty') or g['access'] not in ('read-only','
 if g['model'] not in set(((a.get('pools') or {}).get(g['pool']) or {}).get('byTier',{}).values()): die('grant_invalid')
 cwd=os.path.realpath(g['cwd']); task=os.path.realpath(g['task_path']); base=os.path.realpath(grants)+os.sep
 if not os.path.isdir(cwd) or not task.startswith(base) or not os.path.isfile(task): die('grant_invalid')
-if g['access']=='edit' and (g['pool']!='thirdparty' or '.worktrees' not in cwd.split(os.sep)): die('grant_invalid')
+home=os.path.realpath(os.path.expanduser('~'))
+try: secret_child=any(n == '.gemini' or n == '.ssh' or n == '.claude' or n.startswith('.claude') for n in os.listdir(cwd))
+except Exception: secret_child=True
+if cwd == home or home.startswith(cwd+os.sep) or secret_child: die('cwd_not_allowed')
+if g['access']=='edit':
+ if g['pool']!='thirdparty' or os.path.basename(os.path.dirname(cwd))!='.worktrees': die('grant_invalid')
+ git=os.path.join(cwd,'.git')
+ try: git_mode=os.lstat(git).st_mode
+ except Exception: die('grant_invalid')
+ if not (stat.S_ISREG(git_mode) or stat.S_ISDIR(git_mode)): die('grant_invalid')
+ try:
+  top=os.path.realpath(subprocess.check_output(['git','-C',cwd,'rev-parse','--show-toplevel'],stderr=subprocess.DEVNULL,text=True).strip())
+  if top != cwd: die('grant_invalid')
+ except SystemExit: raise
+ except Exception: die('grant_invalid')
 try: os.replace(p,p+'.used')
 except FileNotFoundError: die('grant_already_used')
 except Exception: die('grant_consume_failed')
@@ -85,28 +100,52 @@ OUT="$OUTDIR/answer.md"; ERR="$OUTDIR/stderr.log"; PROMPT_FILE="$OUTDIR/prompt.t
 # agy needs a read_file grant for anything outside its workspace, which headless
 # mode auto-denies, so the task is copied into OUTDIR and OUTDIR joins the workspace.
 TASK_COPY="$OUTDIR/task.md"; cp "$TASK" "$TASK_COPY" || fail could_not_copy_task
-PROMPT="You are a headless delegated subagent. You are already in the project directory; list and read files with your file tools. Do not use find (it is not allowed and aborts the run). Never run tests, builds, installers or scripts: the caller runs them, and any command outside the allowed read-only list aborts your whole run and discards your reply. Read the task file at $TASK_COPY with your file-viewing tool; prefer that tool over a shell. If you use the shell, use only single simple allowed commands (chains only when every command is allowed). Writes outside the permitted directory are blocked by an OS sandbox and will fail. Report failures honestly; never claim a write or command succeeded without its output."
+TASK_IN_BOX="/relay/task.md"
+PROMPT="You are a headless delegated subagent. You are already in the project directory; list and read files with your file tools. Do not use find (it is not allowed and aborts the run). Never run tests, builds, installers or scripts: the caller runs them, and any command outside the allowed read-only list aborts your whole run and discards your reply. Read the task file at $TASK_IN_BOX with your file-viewing tool; prefer that tool over a shell. If you use the shell, use only single simple allowed commands (chains only when every command is allowed). Writes outside the permitted directory are blocked by an OS sandbox and will fail. Report failures honestly; never claim a write or command succeeded without its output."
 printf '%s\n' "$PROMPT" > "$PROMPT_FILE"
 
-# Broad read-only root first, then make $HOME default-deny.  Every permitted
-# home path is deliberately rebound after this tmpfs overlay.
-ARGS=(--ro-bind / / --tmpfs "$HOME")
-[ -d "$HOME/.gemini" ] && ARGS+=(--bind "$HOME/.gemini" "$HOME/.gemini")
-for p in "$HOME/.gemini/antigravity-cli/settings.json" "$HOME/.gemini/GEMINI.md" "$HOME/.gemini/settings.json" "$HOME/.gemini/policies"; do [ -e "$p" ] && ARGS+=(--ro-bind "$p" "$p"); done
-# The configured executable may itself live under $HOME.
-ARGS+=(--ro-bind "$BINARY" "$BINARY")
+# A tmpfs root lets us create /workspace before any readonly host mount. Only
+# the runtime system directories needed by the CLI are exposed below.
+ARGS=(--tmpfs / --dir /workspace --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64)
+# /run is required on systemd hosts because /etc/resolv.conf commonly points
+# there; it is still readonly inside the sandbox.
+for p in /usr /etc /opt /run; do [ -e "$p" ] && ARGS+=(--ro-bind "$p" "$p"); done
+ARGS+=(--dir /home --dir "$HOME" --tmpfs "$HOME")
+
+# Make parent paths in the tmpfs root before a bind/hide at an absolute host
+# pathname. This is needed for Git's linked-worktree metadata and nested hide
+# entries such as ~/.local/share/keyrings.
+ensure_box_parents() {
+  local p="$1" parent part built=""
+  parent="${p%/*}"; [ -n "$parent" ] || return
+  IFS=/ read -r -a pieces <<< "${parent#/}"
+  for part in "${pieces[@]}"; do
+    [ -n "$part" ] || continue
+    built="$built/$part"
+    ARGS+=(--dir "$built")
+  done
+}
 
 # /tmp is private.  Put it before paths which may themselves live under the
 # real /tmp, including OUTDIR and a checkout used as CWD.
 ARGS+=(--bind "$PRIVTMP" /tmp)
+# The captured realpath is intentionally mounted at a fixed destination: a
+# same-UID rename cannot turn the in-box workspace into a different pathname.
+if [ "$ACCESS" = edit ]; then ARGS+=(--bind "$CWD" /workspace); else ARGS+=(--ro-bind "$CWD" /workspace); fi
+if [ -n "$GIT_COMMON_DIR" ]; then ensure_box_parents "$GIT_COMMON_DIR"; ARGS+=(--ro-bind "$GIT_COMMON_DIR" "$GIT_COMMON_DIR"); fi
+if [ "$ACCESS" = edit ]; then ARGS+=(--ro-bind "$CWD/.git" /workspace/.git); fi
+
+# Apply hiding only after cwd/git binds. In particular, never skip a $HOME path:
+# a future unsafe bind cannot accidentally punch through this deny list.
 while IFS= read -r hidden; do
-  # $HOME is already empty except for the explicit mounts above.  Retain the
-  # configurable hide list for paths elsewhere in the filesystem only.
-  case "$hidden" in '$HOME'|'$HOME'/*|"$HOME"|"$HOME"/*) continue ;; esac
-  if [ -d "$hidden" ]; then ARGS+=(--tmpfs "$hidden"); elif [ -f "$hidden" ]; then ARGS+=(--ro-bind /dev/null "$hidden"); fi
+  hidden="${hidden/\$HOME/$HOME}"
+  for target in $hidden; do
+    ensure_box_parents "$target"
+    if [ -d "$target" ]; then ARGS+=(--tmpfs "$target"); elif [ -f "$target" ]; then ARGS+=(--ro-bind /dev/null "$target"); fi
+  done
 done < <(python3 - "$POLICY" <<'PY'
 import json,sys
-default=['$HOME/.ssh','$HOME/.gnupg','$HOME/.aws','$HOME/.config/gcloud','$HOME/.docker','$HOME/.kube','$HOME/.netrc']
+default=['$HOME/.ssh','$HOME/.gnupg','$HOME/.aws','$HOME/.claude*','$HOME/.config','$HOME/.local/share/keyrings','$HOME/.docker','$HOME/.kube','$HOME/.netrc']
 try:
  h=((json.load(open(sys.argv[1])).get('agy') or {}).get('sandbox') or {}).get('hide',default)
  for x in h:
@@ -114,17 +153,48 @@ try:
 except Exception: pass
 PY
 )
-ARGS+=(--bind "$OUTDIR" "$OUTDIR")
-if [ "$ACCESS" = edit ]; then ARGS+=(--bind "$CWD" "$CWD"); else ARGS+=(--ro-bind "$CWD" "$CWD"); fi
-[ -n "$GIT_COMMON_DIR" ] && ARGS+=(--ro-bind "$GIT_COMMON_DIR" "$GIT_COMMON_DIR")
-ARGS+=(--dev /dev --proc /proc --die-with-parent --chdir "$CWD" --)
+
+# Gemini configuration is code-adjacent input, so the whole tree stays readonly.
+# Only the CLI's observed runtime state is writable, and each target is rebound
+# after the readonly parent. Create the state targets outside the box first.
+GEMINI="$HOME/.gemini"; AGY_STATE="$GEMINI/antigravity-cli"
+if [ -d "$GEMINI" ]; then
+  mkdir -p "$AGY_STATE"/{brain,conversations,cache,log,implicit,annotations,crashes,presence} 2>/dev/null || true
+  for f in history.jsonl conversation_summaries.db jetski_state.pbtxt jetbox_summaries_proto.pb last_check.timestamp; do
+    [ -e "$AGY_STATE/$f" ] || : > "$AGY_STATE/$f" 2>/dev/null || true
+  done
+  ensure_box_parents "$GEMINI"
+  ARGS+=(--ro-bind "$GEMINI" "$GEMINI")
+  for p in brain conversations cache log implicit annotations crashes presence history.jsonl conversation_summaries.db jetski_state.pbtxt jetbox_summaries_proto.pb last_check.timestamp; do
+    [ -e "$AGY_STATE/$p" ] && ARGS+=(--bind "$AGY_STATE/$p" "$AGY_STATE/$p")
+  done
+fi
+# The configured executable may itself live under $HOME.
+ARGS+=(--ro-bind "$BINARY" /agy)
+ARGS+=(--dir /relay --bind "$OUTDIR" /relay)
+ARGS+=(--dev /dev --proc /proc --die-with-parent --chdir /workspace --)
 MODE=(); [ "$ACCESS" = edit ] && MODE=(--mode accept-edits)
-SUP="$(python3 "$ROOT/bin/codex-supervise.py" --command 900 "$OUT" "$ERR" "$OUT" "$PROMPT_FILE" "$MODEL" "$CWD" -- "$SANDBOX" "${ARGS[@]}" "$BINARY" -p "$PROMPT" --add-dir "$OUTDIR" --model "$MODEL" --print-timeout 900s "${MODE[@]}")"
-python3 - "$SUP" "$POOL" "$MODEL" "$ACCESS" "$CWD" "$OUT" "$ERR" <<'PY'
+SOURCE_STAT="$(stat -Lc '%d:%i' "$CWD" 2>/dev/null || true)"
+SUPFILE="$OUTDIR/supervisor.json"
+python3 "$ROOT/bin/codex-supervise.py" --command 900 "$OUT" "$ERR" "$OUT" "$PROMPT_FILE" "$MODEL" "$CWD" -- "$SANDBOX" "${ARGS[@]}" /agy -p "$PROMPT" --add-dir /relay --model "$MODEL" --print-timeout 900s "${MODE[@]}" > "$SUPFILE" &
+SUP_PID=$!
+# Re-check immediately after launch. This narrows the same-UID rename window;
+# an attacker already executing as this UID remains outside this wrapper's scope.
+sleep 0.05
+FORCED_REASON=""
+if [ "$SOURCE_STAT" != "$(stat -Lc '%d:%i' "$CWD" 2>/dev/null || true)" ]; then
+  FORCED_REASON="cwd_changed"
+  kill "$SUP_PID" 2>/dev/null || true
+fi
+wait "$SUP_PID" || true
+SUP="$(cat "$SUPFILE" 2>/dev/null || true)"
+NESTED_GIT=""
+[ "$ACCESS" = edit ] && NESTED_GIT="$(find "$CWD" -mindepth 2 -name .git -print -quit 2>/dev/null || true)"
+python3 - "$SUP" "$POOL" "$MODEL" "$ACCESS" "$CWD" "$OUT" "$ERR" "$FORCED_REASON" "$NESTED_GIT" <<'PY'
 import json,os,re,sys
 try: result=json.loads(sys.argv[1])
 except Exception: result={'ok':False,'exit_code':2,'reason':'supervisor produced invalid JSON'}
-pool,model,access,cwd,out,err=sys.argv[2:]
+pool,model,access,cwd,out,err,forced,nested=sys.argv[2:]
 # The supervisor already marks an empty answer as failed; name the real cause when
 # agy says a headless permission prompt was auto-denied.
 try:
@@ -136,6 +206,20 @@ try:
   if access=='edit': result['edits_may_exist']=True; result['check']='git -C %s status --short' % cwd
 except Exception: pass
 result.update({'pool':pool,'model':model,'access':access,'cwd':cwd}); result.pop('effort',None); result.pop('sandbox',None)
-print(json.dumps(result)); sys.exit(0 if result.get('ok') else 1)
+if forced:
+ result.update({'ok':False,'reason':forced})
+if nested:
+ result.update({'ok':False,'reason':'nested_git_created'})
+cap=200*1024
+try: answer=open(out,'rb').read(); truncated=len(answer)>cap
+except Exception: answer=b''; truncated=False
+result['truncated']=truncated
+print(json.dumps(result)); sys.stdout.flush()
+print('--- AGY-ANSWER ---'); sys.stdout.flush()
+if result.get('ok'):
+ sys.stdout.buffer.write(answer[:cap])
+ if truncated: sys.stdout.buffer.write(b'\n\n[AGY answer truncated at 200 KiB]\n')
+ sys.stdout.flush()
+sys.exit(0 if result.get('ok') else 1)
 PY
 exit $?

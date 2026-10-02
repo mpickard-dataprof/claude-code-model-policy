@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// PreToolUse hook, matcher: Agent|Workflow|Bash|Write|Edit|NotebookEdit
+// PreToolUse hook, matcher: Agent|Workflow|Bash|Read|Glob|Grep|Write|Edit|NotebookEdit
 //
 // Agent    -> rewrites tool_input.model to the policy tier.
 // Workflow -> denies only a wide fan-out that sets no models at all.
@@ -12,7 +12,7 @@ import {
   sessionTierFromTranscript, writeSessionTier, tierIndex, promptFingerprint,
   stripCodeNoise, injectWorkflowTiers, resolveWorkflowScript, sessionTierFor,
   ledger, emit, recordSessionEvent, promptHash, resolveCodexOffload, resolveAgyOffload,
-  offloadTag, issueAgyGrant, agyRelayPreamble, ROOT,
+  offloadTag, issueAgyGrant, agyRelayPreamble, agyCwdAllowed, ROOT,
 } from './lib.mjs';
 import { join } from 'node:path';
 
@@ -54,7 +54,7 @@ async function main() {
         hookEventName: 'PreToolUse', permissionDecision: 'deny',
         permissionDecisionReason: tool === 'Bash'
           ? 'model-policy: the agy relay may only run its exact gate-issued grant command.'
-          : 'model-policy: the agy relay may only Read and run its exact gate-issued grant command.',
+          : 'model-policy: the agy relay may only run its exact gate-issued grant command.',
       },
     });
     return;
@@ -236,9 +236,20 @@ async function main() {
       offload = resolveCodexOffload(toolInput, policy, offloadTier, currentType, record);
       offloadBackend = offload ? 'codex' : null;
     }
+    let agyCwdRejected = false;
     if (!offload && (tag?.startsWith('agy:') || !tag || isAgyRelayType)) {
-      offload = resolveAgyOffload(toolInput, policy, offloadTier, currentType, record, input.cwd);
-      offloadBackend = offload ? 'agy' : null;
+      if (!agyCwdAllowed(input.cwd)) {
+        // Do not spawn a relay merely to fail in the wrapper: native routing is
+        // safe, and this ledger entry makes the fallback observable.
+        agyCwdRejected = true;
+        ledger({ event: 'route', tool: 'Agent', session_id: input.session_id,
+          tool_use_id: input.tool_use_id, agent_type: currentType,
+          reason: 'cwd_not_allowed', offload: 'agy', denied: false,
+        }, policy.limits?.ledgerMaxBytes);
+      } else {
+        offload = resolveAgyOffload(toolInput, policy, offloadTier, currentType, record, input.cwd);
+        offloadBackend = offload ? 'agy' : null;
+      }
     }
     if (offloadBackend === 'agy') {
       const grant = issueAgyGrant({ ...offload, task: toolInput.prompt, sessionId: input.session_id });
@@ -316,6 +327,7 @@ async function main() {
       offload_model: offload?.model ?? null,
       offload_effort: offloadBackend === 'codex' ? offload?.effort ?? null : null,
       offload_via: offload?.via ?? null,
+      agy_cwd_rejected: agyCwdRejected,
       rule: offload
         ? (offloadBackend === 'agy'
           ? `${offloadRule}+offload:agy/${offload.pool}/${offload.model}`
