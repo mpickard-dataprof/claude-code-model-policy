@@ -21,11 +21,9 @@ Two new offload backends via Google's `agy -p` CLI, parallel to `[gpt]`/Codex.
 - [x] agy relay agent (Bash/Read only), SessionStart brief, per-account usage snapshot
 - [x] test.sh: routing, grants, relay hook, sandbox binds, usage spill and wrapper guards
 - [x] CHANGELOG 0.4.0, README
-- [x] Reviews: rounds 1-5 (Codex + Opus); live smoke tests of both pools. Round 5 not clean on edit mode -> shipped with [agy] [edit] OFF (2026-10-02).
 
 ## Follow-up (after agy build lands)
 - [ ] Re-enable [agy] [edit]: make copy-back transactional (stage + rollback, or report partial application), then a fresh review round. Code is in place behind agy.editEnabled; see tasks/reviews/r5-codex.md.
 - [ ] Gemini test-runner role: per-project allow-listed test script; returns pass/fail counts + per-failure name/cause/file. Long timeout (GridGrade suite ~50 min). Owner runs the allow-list setup. Spot-check EVERY run while on probation (tasks/gemini-track-record.md).
 - [x] model-policy-tune skill (skill/SKILL.md): new step before "7. Propose the diff" — "Offload backends on probation": read tasks/gemini-track-record.md + agy ledger rows (offload:"agy", by pool/task type); report accuracy per task type; recommend promote (e.g. Gemini as a counted reviewer, test-runner without spot-checks) / keep probation / demote; promotions need the owner's OK and are recorded in policy.json + the track record. Owner request 2026-10-01.
 - [x] Graceful when agy is absent (MacBook/s2server have no agy yet): no [gemini]/[agy]/usage-spill routing when the configured agy binary is missing (check at SessionStart, record in session state); brief says so.
-- [ ] Ship: PR -> merge -> on linux workstation, mbp, s2server: git pull ~/.claude-shared/model-policy + ./install.sh + ./verify.sh (owner request 2026-10-01). s2server has untracked SPEC.md in the install — leave it.
