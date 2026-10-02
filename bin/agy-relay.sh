@@ -232,7 +232,7 @@ fi
 # before every shell command. The host copy must stay readonly - an unsandboxed
 # agy would later run whatever a box wrote there - so each run gets a private,
 # throwaway bin/ and the binary is also visible readonly at its real path.
-[ -d "$AGY_STATE/bin" ] && ARGS+=(--tmpfs "$AGY_STATE/bin")
+if [ -d "$GEMINI" ]; then mkdir -p "$AGY_STATE/bin" 2>/dev/null || true; ARGS+=(--tmpfs "$AGY_STATE/bin"); fi
 ARGS+=(--ro-bind "$BINARY" /agy)
 ensure_box_parents "$BINARY"; ARGS+=(--ro-bind "$BINARY" "$BINARY")
 # /relay contains task input only. Worker stdout is captured through the
