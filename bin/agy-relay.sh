@@ -62,6 +62,21 @@ PY
 case "$BINARY" in '$HOME'/*) BINARY="$HOME/${BINARY#\$HOME/}" ;; esac
 case "$BINARY" in /*) ;; *) fail agy_binary_unavailable ;; esac
 [ -x "$BINARY" ] || fail agy_binary_unavailable
+# Bind the executable's resolved file rather than the configured symlink.  In
+# particular, an agy installed below $HOME would otherwise disappear behind the
+# home tmpfs below.
+BINARY="$(realpath "$BINARY")" || fail agy_binary_unavailable
+[ -f "$BINARY" ] || fail agy_binary_unavailable
+
+# Linked worktrees use a .git file which points into the main checkout's common
+# git directory.  Re-expose that directory so ordinary read-only git commands
+# still work without making the rest of the user's home visible.
+GIT_COMMON_DIR="$(git -C "$CWD" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+if [ -n "$GIT_COMMON_DIR" ] && [ -d "$GIT_COMMON_DIR" ]; then
+  GIT_COMMON_DIR="$(realpath "$GIT_COMMON_DIR")"
+else
+  GIT_COMMON_DIR=""
+fi
 
 OUTBASE="${MODEL_POLICY_AGY_OUTBASE:-${TMPDIR:-/tmp}}"
 OUTDIR="$(mktemp -d "$OUTBASE/agy-relay.XXXXXX")" || fail could_not_create_output_dir
@@ -70,16 +85,24 @@ OUT="$OUTDIR/answer.md"; ERR="$OUTDIR/stderr.log"; PROMPT_FILE="$OUTDIR/prompt.t
 # agy needs a read_file grant for anything outside its workspace, which headless
 # mode auto-denies, so the task is copied into OUTDIR and OUTDIR joins the workspace.
 TASK_COPY="$OUTDIR/task.md"; cp "$TASK" "$TASK_COPY" || fail could_not_copy_task
-PROMPT="You are a headless delegated subagent. Read the task file at $TASK_COPY with your file-viewing tool; prefer that tool over a shell. If you use the shell, use only single simple allowed commands (chains only when every command is allowed). Writes outside the permitted directory are blocked by an OS sandbox and will fail. Report failures honestly; never claim a write or command succeeded without its output."
+PROMPT="You are a headless delegated subagent. You are already in the project directory; list and read files with your file tools. Do not use find (it is not allowed and aborts the run). Read the task file at $TASK_COPY with your file-viewing tool; prefer that tool over a shell. If you use the shell, use only single simple allowed commands (chains only when every command is allowed). Writes outside the permitted directory are blocked by an OS sandbox and will fail. Report failures honestly; never claim a write or command succeeded without its output."
 printf '%s\n' "$PROMPT" > "$PROMPT_FILE"
 
-# Broad read-only root first. Later mounts deliberately overlay it; /tmp is before
-# OUTDIR/worktree so paths underneath real /tmp remain visible in the sandbox.
-ARGS=(--ro-bind / /)
+# Broad read-only root first, then make $HOME default-deny.  Every permitted
+# home path is deliberately rebound after this tmpfs overlay.
+ARGS=(--ro-bind / / --tmpfs "$HOME")
 [ -d "$HOME/.gemini" ] && ARGS+=(--bind "$HOME/.gemini" "$HOME/.gemini")
 for p in "$HOME/.gemini/antigravity-cli/settings.json" "$HOME/.gemini/GEMINI.md" "$HOME/.gemini/settings.json" "$HOME/.gemini/policies"; do [ -e "$p" ] && ARGS+=(--ro-bind "$p" "$p"); done
+# The configured executable may itself live under $HOME.
+ARGS+=(--ro-bind "$BINARY" "$BINARY")
+
+# /tmp is private.  Put it before paths which may themselves live under the
+# real /tmp, including OUTDIR and a checkout used as CWD.
+ARGS+=(--bind "$PRIVTMP" /tmp)
 while IFS= read -r hidden; do
-  case "$hidden" in '$HOME'/*) hidden="$HOME/${hidden#\$HOME/}" ;; esac
+  # $HOME is already empty except for the explicit mounts above.  Retain the
+  # configurable hide list for paths elsewhere in the filesystem only.
+  case "$hidden" in '$HOME'|'$HOME'/*|"$HOME"|"$HOME"/*) continue ;; esac
   if [ -d "$hidden" ]; then ARGS+=(--tmpfs "$hidden"); elif [ -f "$hidden" ]; then ARGS+=(--ro-bind /dev/null "$hidden"); fi
 done < <(python3 - "$POLICY" <<'PY'
 import json,sys
@@ -91,9 +114,9 @@ try:
 except Exception: pass
 PY
 )
-for d in "$HOME"/.claude*; do [ -f "$d/.credentials.json" ] && ARGS+=(--ro-bind /dev/null "$d/.credentials.json"); done
-ARGS+=(--bind "$PRIVTMP" /tmp --bind "$OUTDIR" "$OUTDIR")
-[ "$ACCESS" = edit ] && ARGS+=(--bind "$CWD" "$CWD")
+ARGS+=(--bind "$OUTDIR" "$OUTDIR")
+if [ "$ACCESS" = edit ]; then ARGS+=(--bind "$CWD" "$CWD"); else ARGS+=(--ro-bind "$CWD" "$CWD"); fi
+[ -n "$GIT_COMMON_DIR" ] && ARGS+=(--ro-bind "$GIT_COMMON_DIR" "$GIT_COMMON_DIR")
 ARGS+=(--dev /dev --proc /proc --die-with-parent --chdir "$CWD" --)
 MODE=(); [ "$ACCESS" = edit ] && MODE=(--mode accept-edits)
 SUP="$(python3 "$ROOT/bin/codex-supervise.py" --command 900 "$OUT" "$ERR" "$OUT" "$PROMPT_FILE" "$MODEL" "$CWD" -- "$SANDBOX" "${ARGS[@]}" "$BINARY" -p "$PROMPT" --add-dir "$OUTDIR" --model "$MODEL" --print-timeout 900s "${MODE[@]}")"

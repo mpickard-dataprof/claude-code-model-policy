@@ -142,6 +142,12 @@ inside a mandatory Linux `bwrap` sandbox; without bubblewrap the tags are inacti
 (including on macOS). Gemini is on probation: verify every result. If tags are combined, precedence is
 `[gpt]` > `[agy]` > `[gemini]`.
 
+The sandbox default-denies your home directory. It re-exposes only agy's own
+state, its executable, the granted checkout, the checkout's shared Git metadata,
+and private relay output. This does not make an untrusted repository safe: the
+model can read every file in the repository under review (including secrets kept
+there) and it retains network access, so it could exfiltrate that material.
+
 Antigravity auto-spills untagged sonnet/opus tasks when the configured Claude
 usage threshold is reached. Add this one line to the status-line script that
 receives Claude Code's status JSON:

@@ -15,6 +15,14 @@
   the relay is limited to its exact grant command, and the wrapper mounts only
   the permitted output/worktree and writable Antigravity state.
 
+### Changed
+
+- The Antigravity bubblewrap sandbox now default-denies `$HOME`, then re-exposes
+  only agy's state and executable plus the granted checkout and needed Git common
+  directory. The granted repository remains readable by the model (including any
+  secrets committed or stored there), and the model retains network access; do
+  not treat the sandbox as protection against exfiltration from that repository.
+
 ## 0.3.0 — offload to ChatGPT models, and `[hard]` means opus
 
 ### Added
