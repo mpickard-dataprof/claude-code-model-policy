@@ -150,8 +150,11 @@ or `.ssh`. Nothing else under `~/.gemini` (browser profile, other tools' history
 account lists) is visible: each run gets a fresh, empty, throwaway
 `~/.gemini/antigravity-cli` with readonly copies of only agy's settings, OAuth token,
 install id and built-ins, so a run can neither read past conversations nor leave
-memory behind. It re-exposes the executable, granted checkout, checkout's shared Git
-metadata, and a task file (worker output is captured by the host supervisor, not
+memory behind. It re-exposes the executable, granted checkout, and a sanitised
+subset of Git metadata for Git itself: repository-shape, extension, and branch
+mapping settings only. Remote URLs, `FETCH_HEAD`, and worktree-specific config
+are overlaid with credential-free files, including for read-only reviews. A task
+file is also mounted (worker output is captured by the host supervisor, not
 mounted into the box). `/run` is never mounted. Network access is intentionally
 shared, so localhost and abstract Unix sockets remain a residual risk.
 
@@ -169,16 +172,28 @@ delta back, so `edit_rejected:apply_failed:<path>` means the host tree was resto
 If rollback itself cannot establish the final state, the result is `edit_partial`
 with `partial.applied`, `partial.restored`, `partial.unknown`, and
 `partial.leftovers`; treat that as an explicit recovery-needed state, never as a
-rejected edit.
+rejected edit. A signal before copy-back is terminal: the relay kills and reaps
+the worker, discards the private copy, and returns `interrupted`; it never turns
+an interrupted copy into a deletion set. Signals during copy-back are handled by
+the transaction itself, which rolls back and reports its own final state.
+
+Before launching an edit worker, the relay refuses a worktree that already has
+`.agy-stage-*` or `.agy-bak-*` files, reporting `edit_leftovers_present` so a
+previous recovery state cannot be mistaken for a fresh transaction. Even after
+a committed rename sequence, an undeletable backup changes the result to
+`edit_partial` rather than success.
 
 For edit runs, review the diff before running anything: edited tests, Makefiles,
 and package scripts run with your normal host permissions when you invoke them.
 For `[agy] [edit]`, Antigravity works in a private throwaway copy of the checkout.
 After it exits, the relay validates the complete delta before copying it back: only
 ordinary files with safe non-dot path components are eligible; agent instructions,
-`node_modules`, executable-bit changes, oversized changes, and host conflicts reject
-the whole delta. Successful results report every applied path and any recoverable
-backup `leftovers`; rejected results name the failed path.
+`node_modules`, known CI entrypoints (including `Jenkinsfile`,
+`azure-pipelines.yml`, AppVeyor, Cloud Build, Bitbucket, Buildspec, Codemagic,
+Bitrise, and Wercker files), executable-bit changes, oversized changes, and host
+conflicts reject the whole delta. Successful results report every applied path;
+any backup cleanup failure is `edit_partial` with recovery leftovers, and
+rejected results name the failed path.
 The sandbox also mitigates, but cannot eliminate, same-UID pathname races; an
 attacker already executing as your user is outside its threat model.
 

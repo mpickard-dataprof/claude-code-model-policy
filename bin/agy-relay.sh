@@ -13,6 +13,14 @@ print('--- AGY-ANSWER ---')
 PY
 }
 fail() { emit false "${2:-2}" "$1" "" 0 "$POOL" "$MODEL" "$ACCESS" "$CWD" 0 ""; exit "${2:-2}"; }
+fail_edit_leftovers() { python3 - "$1" "$POOL" "$MODEL" "$ACCESS" "$CWD" <<'PY'
+import json,sys
+leftovers=json.loads(sys.argv[1])
+print(json.dumps({'ok':False,'exit_code':2,'reason':'edit_leftovers_present','output_file':None,'output_bytes':0,'truncated':False,'pool':sys.argv[2] or None,'model':sys.argv[3] or None,'access':sys.argv[4] or None,'cwd':sys.argv[5] or None,'elapsed_s':0,'stderr_tail':None,'teardown':'n/a: no worker was started','leftovers':leftovers}))
+print('--- AGY-ANSWER ---')
+PY
+exit 2
+}
 
 [ "$#" -eq 2 ] && [ "$1" = "--grant" ] || fail grant_interface_required
 GRANT_ID="$2"
@@ -104,7 +112,25 @@ OUTDIR="$(mktemp -d "$OUTBASE/agy-relay.XXXXXX")" || fail could_not_create_outpu
 PRIVTMP="$(mktemp -d "$OUTBASE/agy-private.XXXXXX")" || fail could_not_create_private_tmp
 COPYDIR=""
 cleanup_private() { [ -z "$COPYDIR" ] || rm -rf -- "$COPYDIR"; rm -rf -- "$PRIVTMP"; }
-trap cleanup_private EXIT INT TERM
+SUP_PID=""
+interrupted=0
+interrupt_worker() {
+  [ "$interrupted" = 1 ] && exit 130
+  interrupted=1
+  trap '' INT TERM HUP
+  if [ -n "$SUP_PID" ]; then
+    # A supervisor that owns its own process group gets the group signal; most
+    # shells leave background jobs in ours, where the PID-only fallback avoids
+    # signalling the relay itself.
+    if [ "$(ps -o pgid= -p "$SUP_PID" 2>/dev/null | tr -d ' ')" = "$SUP_PID" ]; then kill -TERM -- "-$SUP_PID" 2>/dev/null || true; else kill -TERM "$SUP_PID" 2>/dev/null || true; fi
+    wait "$SUP_PID" 2>/dev/null || true
+  fi
+  cleanup_private
+  emit false 130 interrupted "" 0 "$POOL" "$MODEL" "$ACCESS" "$CWD" 0 ""
+  exit 130
+}
+trap cleanup_private EXIT
+trap interrupt_worker INT TERM HUP
 OUT="$OUTDIR/answer.md"; ERR="$OUTDIR/stderr.log"; PROMPT_FILE="$OUTDIR/prompt.txt"
 # agy needs a read_file grant for anything outside its workspace, which headless
 # mode auto-denies, so the task is copied into OUTDIR and OUTDIR joins the workspace.
@@ -119,6 +145,17 @@ printf '%s\n' "$PROMPT" > "$PROMPT_FILE"
 # Never under PRIVTMP: that is the box's writable /tmp. OUTDIR is not bound in.
 BASELINE="$OUTDIR/edit-baseline.json"
 if [ "$ACCESS" = edit ]; then
+  EDIT_LEFTOVERS="$(python3 - "$CWD" <<'PY'
+import json,os,sys
+out=[]
+for root,ds,fs in os.walk(sys.argv[1],followlinks=False):
+ if '.git' in ds: ds.remove('.git')
+ for n in fs:
+  if n.startswith(('.agy-stage-','.agy-bak-')): out.append(os.path.relpath(os.path.join(root,n),sys.argv[1]))
+print(json.dumps(sorted(out)))
+PY
+)"
+  [ "$EDIT_LEFTOVERS" = '[]' ] || fail_edit_leftovers "$EDIT_LEFTOVERS"
   COPYDIR="$(mktemp -d "$OUTBASE/agy-edit.XXXXXX")" || fail could_not_create_edit_copy
   python3 - "$CWD" "$COPYDIR" "$BASELINE" <<'PY' || fail could_not_copy_edit_workspace
 import hashlib,json,os,stat,subprocess,sys
@@ -173,6 +210,27 @@ PY
   fi
 fi
 
+# A repository config and FETCH_HEAD can contain remote credentials.  Keep the
+# Git shape needed for read-only history commands, but bind only a per-run
+# allowlisted config and empty FETCH_HEAD files into the box.
+SANITIZED_GIT_DIR="$OUTDIR/git-sanitized"; mkdir -p "$SANITIZED_GIT_DIR" || fail could_not_create_output_dir
+sanitize_git_config() { python3 - "$1" "$2" <<'PY'
+import os,subprocess,sys
+src,dst=sys.argv[1:]
+open(dst,'w').close()
+if not os.path.isfile(src): raise SystemExit
+pattern=r'^(core\.(repositoryformatversion|bare|filemode|logallrefupdates|ignorecase|precomposeunicode|symlinks)|extensions\..*|branch\..*\.(remote|merge))$'
+p=subprocess.run(['git','config','-f',src,'--null','--get-regexp',pattern],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+if p.returncode not in (0,1): raise SystemExit(1)
+for record in p.stdout.split(b'\0'):
+ if not record: continue
+ try: key,value=record.decode('utf-8','surrogateescape').split('\n',1)
+ except ValueError: raise SystemExit(1)
+ subprocess.run(['git','config','-f',dst,'--add',key,value],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+PY
+}
+GIT_DIR="$(git -C "$CWD" rev-parse --absolute-git-dir 2>/dev/null || true)"
+
 # A tmpfs root lets us create /workspace before any readonly host mount. Only
 # the runtime system directories needed by the CLI are exposed below.
 ARGS=(--tmpfs / --dir /workspace --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64)
@@ -216,6 +274,29 @@ ARGS+=(--bind "$PRIVTMP" /tmp)
 if [ "$ACCESS" = edit ]; then ARGS+=(--bind "$COPYDIR" /workspace); else ARGS+=(--ro-bind "$CWD" /workspace); fi
 if [ -n "$GIT_COMMON_DIR" ]; then ensure_box_parents "$GIT_COMMON_DIR"; ARGS+=(--ro-bind "$GIT_COMMON_DIR" "$GIT_COMMON_DIR"); fi
 if [ "$ACCESS" = edit ]; then ARGS+=(--ro-bind "$CWD/.git" /workspace/.git); fi
+add_git_overlays() {
+  local hostdir="$1" boxdir="$2" label="$3" cfg empty
+  [ -d "$hostdir" ] || return
+  if [ -f "$hostdir/config" ]; then
+    cfg="$SANITIZED_GIT_DIR/$label-config"; sanitize_git_config "$hostdir/config" "$cfg" || fail could_not_sanitize_git_config
+    ARGS+=(--ro-bind "$cfg" "$boxdir/config")
+  fi
+  if [ -f "$hostdir/config.worktree" ]; then
+    cfg="$SANITIZED_GIT_DIR/$label-config.worktree"; sanitize_git_config "$hostdir/config.worktree" "$cfg" || fail could_not_sanitize_git_config
+    ARGS+=(--ro-bind "$cfg" "$boxdir/config.worktree")
+  fi
+  if [ -e "$hostdir/FETCH_HEAD" ]; then
+    empty="$SANITIZED_GIT_DIR/$label-FETCH_HEAD"; : > "$empty"
+    ARGS+=(--ro-bind "$empty" "$boxdir/FETCH_HEAD")
+  fi
+}
+if [ -n "$GIT_COMMON_DIR" ]; then add_git_overlays "$GIT_COMMON_DIR" "$GIT_COMMON_DIR" common; fi
+# Only overlay git dirs that are actually mounted: CWD/.git itself, or a linked
+# worktree's gitdir inside the validated common dir. Anything else is not visible.
+if [ -n "$GIT_DIR" ] && [ -d "$GIT_DIR" ]; then
+  if [ "$GIT_DIR" = "$CWD/.git" ]; then add_git_overlays "$GIT_DIR" /workspace/.git worktree
+  elif [ -n "$GIT_COMMON_DIR" ] && [ "${GIT_DIR#"$GIT_COMMON_DIR"/worktrees/}" != "$GIT_DIR" ]; then add_git_overlays "$GIT_DIR" "$GIT_DIR" worktree; fi
+fi
 
 # Apply hiding only after cwd/git binds. In particular, never skip a $HOME path:
 # a future unsafe bind cannot accidentally punch through this deny list.
@@ -293,12 +374,22 @@ PY
 )"
 EDIT_RESULT='{}'
 if [ "$ACCESS" = edit ]; then
+  # Test-only: exercise the defence against a disappeared private copy. This
+  # variable is intentionally not forwarded through bwrap's --clearenv.
+  if [ "${MODEL_POLICY_AGY_TEST_DROP_COPY:-}" = 1 ]; then rm -rf -- "$COPYDIR"; fi
+  # Let copy-back own signals: it journals and rolls them back. The shell must
+  # neither exit early nor remove its source copy while that is happening.
+  trap '' INT TERM HUP
   EDIT_RESULT="$(python3 - "$CWD" "$COPYDIR" "$BASELINE" 2>>"$OUTDIR/copyback.err" <<'PY'
 import hashlib,json,os,re,signal,stat,sys,tempfile
 cwd,copy,baseline_path=sys.argv[1:]
-base=json.load(open(baseline_path,encoding='utf-8'))
+def copy_missing(path):
+ print(json.dumps({'ok':False,'reason':'edit_rejected:copy_missing:'+path,'rejected':{'rule':'copy_missing','path':path}})); raise SystemExit
+if not os.path.isdir(copy) or not os.path.lexists(os.path.join(copy,'.git')): copy_missing('copydir')
+try: base=json.load(open(baseline_path,encoding='utf-8'))
+except Exception: copy_missing('baseline')
 valid_component=re.compile(r'^[A-Za-z0-9_][A-Za-z0-9._+-]*$')
-deny={'claude.md','claude.local.md','agents.md','agent.md','gemini.md','node_modules'}
+deny={'claude.md','claude.local.md','agents.md','agent.md','gemini.md','node_modules','jenkinsfile','azure-pipelines.yml','azure-pipelines.yaml','appveyor.yml','appveyor.yaml','cloudbuild.yml','cloudbuild.yaml','bitbucket-pipelines.yml','buildspec.yml','buildspec.yaml','codemagic.yaml','bitrise.yml','wercker.yml'}
 def sha(path):
  h=hashlib.sha256()
  with open(path,'rb') as f:
@@ -405,9 +496,10 @@ def checked_host(p):
  hp=os.path.join(cwd,p); st=os.lstat(hp)
  if not stat.S_ISREG(st.st_mode) or sha(hp)!=base[p]['host_sha256']: raise ApplyFailure(p)
  return hp
-# Test hooks: relay-only MODEL_POLICY_AGY_FAIL_AT and MODEL_POLICY_AGY_FAIL_ROLLBACK only inject failures; --clearenv keeps them out of the box.
+# Test hooks: relay-only MODEL_POLICY_AGY_FAIL_* only inject failures; --clearenv keeps them out of the box.
 fail_at=int(os.environ.get('MODEL_POLICY_AGY_FAIL_AT','0') or 0)
 fail_rollback=os.environ.get('MODEL_POLICY_AGY_FAIL_ROLLBACK')=='1'
+fail_bak_unlink=os.environ.get('MODEL_POLICY_AGY_FAIL_BAK_UNLINK')=='1'
 rename_count=0; rollback_fault_used=False
 def commit_rename(src,dst,p):
  global rename_count
@@ -471,9 +563,14 @@ else:
  leftovers=[]
  for item in journal:
   if item['backup_moved'] and os.path.lexists(item['backup']):
-   try: os.unlink(item['backup'])
+   if fail_bak_unlink:
+    leftovers.append(relpath(item['backup'])); continue
+   try:
+    os.unlink(item['backup'])
    except Exception: leftovers.append(relpath(item['backup']))
- print(json.dumps({'ok':True,'changes':{'added':added,'modified':modified,'deleted':deleted},**({'leftovers':leftovers} if leftovers else {})})); raise SystemExit
+ changes={'added':added,'modified':modified,'deleted':deleted}
+ if leftovers: print(json.dumps({'ok':False,'reason':'edit_partial','changes':changes,'partial':{'applied':changed,'restored':[],'unknown':[],'leftovers':leftovers}})); raise SystemExit
+ print(json.dumps({'ok':True,'changes':changes})); raise SystemExit
 # An interrupted or failed commit rolls its journal backwards. Continue after a
 # rollback error so unrelated paths are restored whenever that is still possible.
 rollback_errors=[]
@@ -515,6 +612,7 @@ if rollback_errors or leftovers or any(v!='restored' for v in states.values()):
 print(json.dumps({'ok':False,'reason':'edit_rejected:apply_failed:'+failed_path,'rejected':{'rule':'apply_failed','path':failed_path}}))
 PY
 )"
+  trap interrupt_worker INT TERM HUP
 fi
 python3 - "$SUP" "$POOL" "$MODEL" "$ACCESS" "$CWD" "$OUT" "$ERR" "$FORCED_REASON" "$EDIT_RESULT" <<'PY'
 import json,os,re,stat,sys
