@@ -173,10 +173,13 @@ fi
 ARGS+=(--ro-bind "$BINARY" /agy)
 ARGS+=(--dir /relay --bind "$OUTDIR" /relay)
 ARGS+=(--dev /dev --proc /proc --die-with-parent --chdir /workspace --)
+# git keeps a worktree's history in the main repo's common dir; models read it
+# directly, and agy needs it in the workspace or the read is auto-denied headless.
+GIT_ADD_DIR=(); [ -n "$GIT_COMMON_DIR" ] && GIT_ADD_DIR=(--add-dir "$GIT_COMMON_DIR")
 MODE=(); [ "$ACCESS" = edit ] && MODE=(--mode accept-edits)
 SOURCE_STAT="$(stat -Lc '%d:%i' "$CWD" 2>/dev/null || true)"
 SUPFILE="$OUTDIR/supervisor.json"
-python3 "$ROOT/bin/codex-supervise.py" --command 900 "$OUT" "$ERR" "$OUT" "$PROMPT_FILE" "$MODEL" "$CWD" -- "$SANDBOX" "${ARGS[@]}" /agy -p "$PROMPT" --add-dir /relay --model "$MODEL" --print-timeout 900s "${MODE[@]}" > "$SUPFILE" &
+python3 "$ROOT/bin/codex-supervise.py" --command 900 "$OUT" "$ERR" "$OUT" "$PROMPT_FILE" "$MODEL" "$CWD" -- "$SANDBOX" "${ARGS[@]}" /agy -p "$PROMPT" --add-dir /relay "${GIT_ADD_DIR[@]}" --model "$MODEL" --print-timeout 900s "${MODE[@]}" > "$SUPFILE" &
 SUP_PID=$!
 # Re-check immediately after launch. This narrows the same-UID rename window;
 # an attacker already executing as this UID remains outside this wrapper's scope.
