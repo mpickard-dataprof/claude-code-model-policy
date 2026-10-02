@@ -135,9 +135,10 @@ Put a tag in the Agent task description to force a tier:
 
 `[gpt]` sends a generic task through the Codex relay. `[gemini]` sends a
 **review only** task through Antigravity's Gemini pool and is always read-only.
-`[agy]` uses Antigravity's third-party pool for reviews or development. Edits require
-both `[agy] [edit]` (the tag is configurable as `agy.editTag`) and one explicit path
-to a real `<repo>/.worktrees/<name>` Git-worktree root. The gate issues a single-use
+`[agy]` uses Antigravity's third-party pool. **Edit mode is shipped off**
+(`agy.editEnabled: false`), so both pools are read-only reviewers; see below. With it
+on, edits require both `[agy] [edit]` (the tag is configurable as `agy.editTag`) and
+one explicit path to a real `<repo>/.worktrees/<name>` Git-worktree root. The gate issues a single-use
 grant and the relay can run only that grant command. Every Antigravity run is
 inside a mandatory Linux `bwrap` sandbox; without bubblewrap the tags are inactive
 (including on macOS). Gemini is on probation: verify every result. If tags are combined, precedence is
@@ -145,8 +146,11 @@ inside a mandatory Linux `bwrap` sandbox; without bubblewrap the tags are inacti
 
 The sandbox default-denies your home directory and rejects a cwd that is home, an
 ancestor of home, too shallow to safely mount, or contains `.claude*`, `.gemini`,
-or `.ssh`. Gemini configuration is read-only; only Antigravity CLI runtime state
-is writable. It re-exposes the executable, granted checkout, checkout's shared Git
+or `.ssh`. Nothing else under `~/.gemini` (browser profile, other tools' history,
+account lists) is visible: each run gets a fresh, empty, throwaway
+`~/.gemini/antigravity-cli` with readonly copies of only agy's settings, OAuth token,
+install id and built-ins, so a run can neither read past conversations nor leave
+memory behind. It re-exposes the executable, granted checkout, checkout's shared Git
 metadata, and a task file (worker output is captured by the host supervisor, not
 mounted into the box). `/run` is never mounted. Network access is intentionally
 shared, so localhost and abstract Unix sockets remain a residual risk.
@@ -156,6 +160,12 @@ the repository under review (including secrets kept there) and it retains networ
 access. The agy OAuth token is also readable inside the box so the CLI can work;
 a prompt-injected run could exfiltrate it. That exposure is inherent to this
 offload design—revoke it on the Google side with `agy logout` if needed.
+
+Why edit mode is off: the round-5 review found that copy-back is not transactional,
+so a write failing mid-apply (disk full, an unwritable directory) leaves part of a
+change set applied while the result says rejected. Do not set `agy.editEnabled`
+until that is fixed and re-reviewed; the wrapper also refuses edit grants while it
+is off. The design below is kept for that work.
 
 For edit runs, review the diff before running anything: edited tests, Makefiles,
 and package scripts run with your normal host permissions when you invoke them.

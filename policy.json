@@ -142,6 +142,8 @@
     "offloadableTypes": ["general-purpose", "claude", ""],
     "relayTier": "haiku",
     "editTag": "[edit]",
+    "_commentEdit": "[agy] [edit] is OFF: round-5 review found copy-back can leave a partial change set when a write fails mid-apply. Do not enable until that is fixed and re-reviewed.",
+    "editEnabled": false,
     "sandbox": {
       "_comment": "Linux bubblewrap is mandatory: agy is unavailable when this executable is absent.",
       "bwrap": "/usr/bin/bwrap",

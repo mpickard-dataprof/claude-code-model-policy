@@ -33,3 +33,9 @@ workstation, the MacBook (`mbp`) and `s2server` (git pull in ~/.claude-shared/mo
 Codex builds with tests; I verify each test fails when its fix is reverted; live-test with real
 bwrap + real agy (Gemini review, Claude worktree edit) and the attack script; then BOTH independent
 reviews (Codex + Opus `[hard]`). Clean round -> ship. Not clean on edit mode -> fallback above.
+
+## Outcome (2026-10-02)
+Copy-back built (Codex), mutation-checked, live-tested with real bwrap + agy and the attack battery.
+Round-5 Codex review still found an edit-mode hole (non-transactional apply) -> FALLBACK taken:
+edit mode shipped off behind `agy.editEnabled`. Fixed in the same round: ~/.gemini exposure,
+baseline location, nested bare repos. Details: tasks/reviews/r5-codex.md.

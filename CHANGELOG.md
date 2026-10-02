@@ -1,26 +1,35 @@
 # Changelog
 
-## Unreleased
-
-- Hardened Antigravity edit runs: workers edit a disposable checkout copy and a
-  validated, conflict-checked delta is the only thing copied back.
-- Linked-worktree Git metadata and Antigravity runtime state now use validated,
-  private mounts; the relay identity is fixed to `agy`.
-
 ## 0.4.0 — Antigravity offload backends
+
+### Shipped read-only
+
+- `[agy] [edit]` is **off** (`agy.editEnabled: false`; the gate and the wrapper
+  both refuse edits). Its copy-back design (private checkout copy, whole-delta
+  validation) is kept but failed review: a write failing mid-apply can leave a
+  partial change set. Both pools are read-only reviewers until that is fixed.
+
+### Security
+
+- Only a genuine linked-worktree chain exposes a Git common directory, so a
+  crafted `.git` file cannot mount another repository.
+- Runs see a fresh, empty, throwaway `~/.gemini/antigravity-cli` plus readonly
+  copies of agy's settings, OAuth token, install id and built-ins — nothing else
+  under `~/.gemini`, and nothing persists.
+- The relay identity is fixed to `agy`; a policy naming another relay disables agy.
 
 ### Added
 
 - `[gemini]` and `[agy]` offload tags through the `agy` relay. Gemini is reviews
-  only and always read-only; the third-party pool also supports constrained edits
-  in a named `.worktrees/` directory. Tag precedence is `[gpt]` > `[agy]` >
+  only and always read-only; the third-party pool's edit mode ships disabled
+  (see above). Tag precedence is `[gpt]` > `[agy]` >
   `[gemini]`.
 - `bin/usage-snapshot.sh` and the `agy.usageSpill` policy: a fresh local
   status-line snapshot can spill untagged sonnet/opus tasks to Antigravity when
   either Claude usage window is high.
 - Antigravity now requires Linux bubblewrap. The gate creates a single-use grant,
   the relay is limited to its exact grant command, and the wrapper mounts only
-  the permitted output/worktree and writable Antigravity state.
+  the permitted checkout and private, throwaway Antigravity state.
 
 ### Changed
 

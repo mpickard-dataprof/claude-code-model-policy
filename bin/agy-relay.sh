@@ -45,6 +45,7 @@ cwd_parts=[p for p in cwd.split(os.sep) if p]
 home_parts=[p for p in home.split(os.sep) if p]
 is_home_ancestor=(len(cwd_parts)<=len(home_parts) and cwd_parts==home_parts[:len(cwd_parts)])
 if cwd == os.sep or len(cwd_parts)<2 or is_home_ancestor or secret_child: die('cwd_not_allowed')
+if g['access']=='edit' and a.get('editEnabled') is not True: die('edit_disabled')
 if g['access']=='edit':
  if g['pool']!='thirdparty' or os.path.basename(os.path.dirname(cwd))!='.worktrees': die('grant_invalid')
  git=os.path.join(cwd,'.git')
@@ -115,7 +116,8 @@ printf '%s\n' "$PROMPT" > "$PROMPT_FILE"
 # Edit workers never see the real checkout writable.  Make a private, ordinary
 # file copy from Git's tracked + unignored view, then copy back only a validated
 # manifest delta after the worker is gone.
-BASELINE="$PRIVTMP/edit-baseline.json"
+# Never under PRIVTMP: that is the box's writable /tmp. OUTDIR is not bound in.
+BASELINE="$OUTDIR/edit-baseline.json"
 if [ "$ACCESS" = edit ]; then
   COPYDIR="$(mktemp -d "$OUTBASE/agy-edit.XXXXXX")" || fail could_not_create_edit_copy
   python3 - "$CWD" "$COPYDIR" "$BASELINE" <<'PY' || fail could_not_copy_edit_workspace
@@ -234,31 +236,19 @@ except Exception: pass
 PY
 )
 
-# Gemini configuration is code-adjacent input, so the whole tree stays readonly.
-# The CLI's mutable state is always a fresh private tree; never create or bind a
-# writable host state path, even when the host happens to have one already.
+# ~/.gemini also holds a browser profile, other tools' chat history and account
+# lists, so none of it is exposed. The box sees one fresh, empty, throwaway
+# antigravity-cli tree (memory, history and agy's bin/agentapi shim all start
+# empty and die with the run) plus readonly copies of only what the CLI needs to
+# start: its settings, OAuth token (a documented exception), install id and
+# built-ins. Nothing written there reaches the host.
 GEMINI="$HOME/.gemini"; AGY_STATE="$GEMINI/antigravity-cli"
-if [ -d "$GEMINI" ]; then
-  PRIVATE_STATE="$PRIVTMP/agy-state"; mkdir -p "$PRIVATE_STATE/bin"
-  for p in brain conversations cache log implicit annotations crashes presence; do mkdir -p "$PRIVATE_STATE/$p"; done
-  for f in history.jsonl conversation_summaries.db jetski_state.pbtxt jetbox_summaries_proto.pb last_check.timestamp cli.log; do
-    if [ -f "$AGY_STATE/$f" ] && [ ! -L "$AGY_STATE/$f" ]; then cp -- "$AGY_STATE/$f" "$PRIVATE_STATE/$f"; else : > "$PRIVATE_STATE/$f"; fi
-  done
-  ensure_box_parents "$GEMINI"
-  ARGS+=(--ro-bind "$GEMINI" "$GEMINI")
-  if [ -d "$AGY_STATE" ]; then
-    for p in brain conversations cache log implicit annotations crashes presence history.jsonl conversation_summaries.db jetski_state.pbtxt jetbox_summaries_proto.pb last_check.timestamp cli.log; do
-      ARGS+=(--bind "$PRIVATE_STATE/$p" "$AGY_STATE/$p")
-    done
-  else
-    ARGS+=(--bind "$PRIVATE_STATE" "$AGY_STATE")
-  fi
-fi
-# agy rewrites bin/agentapi (a shim that execs the agy binary by its real path)
-# before every shell command. The host copy must stay readonly - an unsandboxed
-# agy would later run whatever a box wrote there - so each run gets a private,
-# throwaway bin/ and the binary is also visible readonly at its real path.
-if [ -d "$GEMINI" ] && [ -d "$AGY_STATE" ]; then ARGS+=(--tmpfs "$AGY_STATE/bin"); fi
+PRIVATE_STATE="$PRIVTMP/agy-state"; mkdir -p "$PRIVATE_STATE" || fail could_not_create_private_state
+ensure_box_parents "$AGY_STATE"; ARGS+=(--dir "$GEMINI" --bind "$PRIVATE_STATE" "$AGY_STATE")
+for p in settings.json antigravity-oauth-token installation_id builtin; do
+  if [ -f "$AGY_STATE/$p" ] && [ ! -L "$AGY_STATE/$p" ]; then : > "$PRIVATE_STATE/$p"; ARGS+=(--ro-bind "$AGY_STATE/$p" "$AGY_STATE/$p")
+  elif [ -d "$AGY_STATE/$p" ] && [ ! -L "$AGY_STATE/$p" ]; then mkdir -p "$PRIVATE_STATE/$p"; ARGS+=(--ro-bind "$AGY_STATE/$p" "$AGY_STATE/$p"); fi
+done
 ARGS+=(--ro-bind "$BINARY" /agy)
 ensure_box_parents "$BINARY"; ARGS+=(--ro-bind "$BINARY" "$BINARY")
 # /relay contains task input only. Worker stdout is captured through the

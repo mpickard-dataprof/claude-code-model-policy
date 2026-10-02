@@ -1108,7 +1108,11 @@ agy_route '[gemini]' "review $WT_ONE" "$PARENT_CWD"
 assert "Gemini worktree request stays read-only in session cwd" "read-only|$PARENT_CWD" "$(agy_grant_access_cwd)"
 agy_route '[agy]' 'review without a worktree path' "$PARENT_CWD"
 assert "[agy] with zero worktree paths stays read-only" "read-only|$PARENT_CWD" "$(agy_grant_access_cwd)"
+EDIT_ON_POLICY="$SANDBOX/edit-on-policy.json"
+"$NODE" -e 'const fs=require("fs"),p=JSON.parse(fs.readFileSync(process.argv[1]));p.agy.editEnabled=true;fs.writeFileSync(process.argv[2],JSON.stringify(p))' "$DIR/policy.json" "$EDIT_ON_POLICY"
 agy_route '[agy] [edit]' "review $WT_ONE" "$PARENT_CWD"
+assert "shipped policy keeps [agy] [edit] read-only (edit is off)" "read-only|$PARENT_CWD" "$(agy_grant_access_cwd)"
+agy_route '[agy] [edit]' "review $WT_ONE" "$PARENT_CWD" "$EDIT_ON_POLICY"
 assert "[agy] [edit] with one worktree root gets edit access" "edit|$WT_ONE" "$(agy_grant_access_cwd)"
 agy_route '[agy]' "review $WT_ONE" "$PARENT_CWD"
 assert "[agy] without [edit] remains read-only" "read-only|$PARENT_CWD" "$(agy_grant_access_cwd)"
@@ -1118,7 +1122,7 @@ agy_route '[agy]' "review $SANDBOX/.worktrees/missing" "$PARENT_CWD"
 assert "a nonexistent worktree path stays read-only" "read-only|$PARENT_CWD" "$(agy_grant_access_cwd)"
 agy_route '[agy]' "review $SUBSTRING_WT" "$PARENT_CWD"
 assert "worktrees as a substring is not edit access" "read-only|$PARENT_CWD" "$(agy_grant_access_cwd)"
-agy_route '[agy] [edit]' "review $LINK_WT" "$PARENT_CWD"
+agy_route '[agy] [edit]' "review $LINK_WT" "$PARENT_CWD" "$EDIT_ON_POLICY"
 assert "a symlink into one worktree gets resolved edit access" "edit|$WT_ONE" "$(agy_grant_access_cwd)"
 UNSAFE_CWD="$SANDBOX/unsafe-cwd"; mkdir -p "$UNSAFE_CWD/.ssh"
 agy_route '[agy]' 'review safely' "$UNSAFE_CWD"
@@ -1203,7 +1207,7 @@ printf '# gemini instructions\n' > "$AGY_HOME/.gemini/GEMINI.md"
 FAKE_BWRAP="$SANDBOX/fake-bwrap"
 printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\n" "$@" > "$BWRAP_ARGV_LOG"' 'ARGS=("$@"); WORKTREE=""; for ((i=0; i<$#; i++)); do if [ "${ARGS[i]}" = "--bind" ] && [ "${ARGS[i+2]:-}" = "/workspace" ]; then WORKTREE="${ARGS[i+1]}"; fi; done' 'AGY_BIN=""; while [ "$1" != -- ]; do if [ "$1" = "--ro-bind" ] && [ "${3:-}" = "/agy" ]; then AGY_BIN="$2"; fi; shift; done; shift; if [ "$1" = "/agy" ]; then shift; [ -z "$WORKTREE" ] || cd "$WORKTREE"; exec "$AGY_BIN" "$@"; fi; exec "$@"' > "$FAKE_BWRAP"
 chmod +x "$FAKE_BWRAP"
-"$NODE" -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync(process.argv[1]));p.agy.binary=process.argv[2];p.agy.sandbox.bwrap=process.argv[3];fs.writeFileSync(process.argv[4],JSON.stringify(p));' "$DIR/policy.json" "$FAKE_AGY" "$FAKE_BWRAP" "$AGY_POLICY"
+"$NODE" -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync(process.argv[1]));p.agy.binary=process.argv[2];p.agy.sandbox.bwrap=process.argv[3];p.agy.editEnabled=true;fs.writeFileSync(process.argv[4],JSON.stringify(p));' "$DIR/policy.json" "$FAKE_AGY" "$FAKE_BWRAP" "$AGY_POLICY"
 mkdir -p "$SANDBOX/.worktrees/x" "$MODEL_POLICY_GRANTS"
 git init -q "$SANDBOX/.worktrees/x"
 grant() { "$NODE" -e 'const fs=require("fs"),path=require("path");const [d,id,pool,model,access,cwd,task]=process.argv.slice(1);fs.writeFileSync(path.join(d,id+".task"),task,{mode:0o600});fs.writeFileSync(path.join(d,id+".json"),JSON.stringify({pool,model,access,cwd,task_path:path.join(d,id+".task"),session_id:"s",created:new Date().toISOString(),expires:new Date(Date.now()+3600000).toISOString()})+"\n",{mode:0o600});' "$MODEL_POLICY_GRANTS" "$@"; }
@@ -1222,6 +1226,10 @@ print(h.hexdigest())
 PY
 }
 json_reason() { printf '%s' "$1" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).reason||"")}catch{}})'; }
+OFF_POLICY="$SANDBOX/edit-off-policy.json"; "$NODE" -e 'const fs=require("fs"),p=JSON.parse(fs.readFileSync(process.argv[1]));delete p.agy.editEnabled;fs.writeFileSync(process.argv[2],JSON.stringify(p))' "$AGY_POLICY" "$OFF_POLICY"
+WT_OFF="$(edit_wt edit-off)"; before="$(tree_hash "$WT_OFF")"; G_OFF="$(printf '%048x' 3999)"; grant "$G_OFF" thirdparty claude-sonnet-4-6 edit "$WT_OFF" 'edit while off'
+out="$(AGY_POLICY="$OFF_POLICY" AGY_EDIT_ACTION='printf changed > base.txt' agy_wrap --grant "$G_OFF")"
+assert "wrapper refuses edit grants unless policy enables edit" "edit_disabled|$before" "$(json_reason "$out")|$(tree_hash "$WT_OFF")"
 WT_EDIT="$(edit_wt edit-ok)"; G1=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 grant "$G1" thirdparty claude-sonnet-4-6 edit "$WT_EDIT" 'edit ordinary files'
 out="$(AGY_EDIT_ACTION='printf changed\\n > base.txt; mkdir -p src; printf new\\n > src/new.txt; rm delete.txt' agy_wrap --grant "$G1")"
@@ -1293,14 +1301,16 @@ out="$(agy_wrap --grant "$G4")"
 assert "read-only grant reaches the worker" true "$(printf '%s' "$out" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String(JSON.parse(s).ok))}catch{process.stdout.write("BADJSON")}})')"
 assert "bwrap tmpfs-hides home before every home re-bind" yes \
   "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n"),h=process.argv[2];const home=a.findIndex((x,i)=>x==="--tmpfs"&&a[i+1]===h);let ok=home>=0;for(let i=0;i<a.length;i++)if((a[i]==="--bind"||a[i]==="--ro-bind")&&(a[i+1].startsWith(h+"/")||a[i+2].startsWith(h+"/")))ok&&=i>home;process.stdout.write(ok?"yes":"no")' "$BWRAP_LOG" "$AGY_HOME")"
-assert "gemini state binds are private copies, never host paths" yes \
-  "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n"),h=process.argv[2],g=h+"/.gemini",s=g+"/antigravity-cli";const ro=a.some((x,i)=>x==="--ro-bind"&&a[i+1]===g&&a[i+2]===g),bad=a.some((x,i)=>x==="--bind"&&a[i+1].startsWith(g)),run=["brain","conversations","cache","log","implicit","annotations","crashes","presence","history.jsonl","conversation_summaries.db","jetski_state.pbtxt","jetbox_summaries_proto.pb","last_check.timestamp","cli.log"].every(n=>a.some((x,i)=>x==="--bind"&&a[i+2]===s+"/"+n&&!a[i+1].startsWith(g)));process.stdout.write(ro&&!bad&&run?"yes":"no")' "$BWRAP_LOG" "$AGY_HOME")"
-assert "bwrap gives agy a private bin after readonly Gemini config" yes \
-  "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n"),g=process.argv[2],ro=a.findIndex((x,i)=>x==="--ro-bind"&&a[i+1]===g&&a[i+2]===g),tmp=a.findIndex((x,i)=>x==="--tmpfs"&&a[i+1]===g+"/antigravity-cli/bin");process.stdout.write(ro>=0&&tmp>ro?"yes":"no")' "$BWRAP_LOG" "$AGY_HOME/.gemini")"
+assert "agy state is a private tree, never a writable host path" yes \
+  "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n"),g=process.argv[2]+"/.gemini",s=g+"/antigravity-cli";const bad=a.some((x,i)=>x==="--bind"&&a[i+1].startsWith(g)),priv=a.some((x,i)=>x==="--bind"&&a[i+2]===s&&!a[i+1].startsWith(g));process.stdout.write(!bad&&priv?"yes":"no")' "$BWRAP_LOG" "$AGY_HOME")"
+assert "only agy startup files from ~/.gemini are visible" yes \
+  "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n"),g=process.argv[2]+"/.gemini",s=g+"/antigravity-cli",ok=["settings.json","antigravity-oauth-token","installation_id","builtin"].map(n=>s+"/"+n);let good=a.some((x,i)=>x==="--ro-bind"&&a[i+1]===s+"/settings.json");for(let i=0;i<a.length;i++)if((a[i]==="--bind"||a[i]==="--ro-bind")&&a[i+1].startsWith(g)&&!ok.includes(a[i+1]))good=false;process.stdout.write(good?"yes":"no")' "$BWRAP_LOG" "$AGY_HOME")"
+assert "host agy bin/ shim dir is never exposed" yes \
+  "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n"),b=process.argv[2]+"/.gemini/antigravity-cli/bin";process.stdout.write(a.some((x,i)=>(x==="--bind"||x==="--ro-bind")&&a[i+1].startsWith(b))?"no":"yes")' "$BWRAP_LOG" "$AGY_HOME")"
 assert "bwrap binds agy binary both at its real path and /agy" yes \
   "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n"),b=process.argv[2];const real=a.some((x,i)=>x==="--ro-bind"&&a[i+1]===b&&a[i+2]===b),alias=a.some((x,i)=>x==="--ro-bind"&&a[i+1]===b&&a[i+2]==="/agy");process.stdout.write(real&&alias?"yes":"no")' "$BWRAP_LOG" "$FAKE_AGY")"
 assert "bwrap re-binds only agy runtime state under home" yes \
-  "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n"),h=process.argv[2],bin=h+"/.local/bin/agy",g=h+"/.gemini",s=g+"/antigravity-cli";let ok=true;for(let i=0;i<a.length;i++)if(a[i]==="--bind"||a[i]==="--ro-bind")for(const p of [a[i+1],a[i+2]])if(p.startsWith(h+"/")&&p!==bin&&p!==g&&!p.startsWith(s+"/"))ok=false;process.stdout.write(ok?"yes":"no")' "$BWRAP_LOG" "$AGY_HOME")"
+  "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n"),h=process.argv[2],bin=h+"/.local/bin/agy",g=h+"/.gemini",s=g+"/antigravity-cli";let ok=true;for(let i=0;i<a.length;i++)if(a[i]==="--bind"||a[i]==="--ro-bind")for(const p of [a[i+1],a[i+2]])if(p.startsWith(h+"/")&&p!==bin&&p!==s&&!p.startsWith(s+"/"))ok=false;process.stdout.write(ok?"yes":"no")' "$BWRAP_LOG" "$AGY_HOME")"
 assert "read-only grant binds cwd read-only" yes \
   "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n"),p=process.argv[2];process.stdout.write(a.some((x,i)=>x==="--ro-bind"&&a[i+1]===p&&a[i+2]==="/workspace")?"yes":"no")' "$BWRAP_LOG" "$GIT_WT")"
 assert "linked worktree common git dir is read-only bound" yes \

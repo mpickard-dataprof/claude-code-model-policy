@@ -495,10 +495,11 @@ export function resolveAgyOffload(toolInput, policy, tier, currentType, record, 
   if (!agyCwdAllowed(parentCwd)) return null;
   let access = 'read-only';
   let grantCwd = parentCwd;
-  // Edits require an explicit, separately configurable owner acknowledgement.
+  // Edits require an explicit, separately configurable owner acknowledgement,
+  // and are off unless policy sets agy.editEnabled (shipped false).
   // Gemini is deliberately never eligible, even if it carries the edit tag.
   const editTag = typeof agy.editTag === 'string' && agy.editTag ? agy.editTag : '[edit]';
-  if (poolName === 'thirdparty' && (via === 'tag' || via === 'auto:usage')
+  if (agy.editEnabled === true && poolName === 'thirdparty' && (via === 'tag' || via === 'auto:usage')
       && String(toolInput?.description ?? '').includes(editTag)) {
     const paths = String(toolInput?.prompt ?? '').match(/\/(?:[^\s'"`\\<>;|&(){}\[\],]+)/g) || [];
     if (paths.length === 1) {
