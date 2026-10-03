@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.1 — `[agy] [edit]` enabled
+
+- `[agy] [edit]` is **on** (`agy.editEnabled: true`) after review rounds 5-8.
+  Known residual sandbox limits, for all agy runs: `/usr`, `/etc` and `/opt` are
+  readable, and abstract Unix sockets are reachable over the shared network.
+
+### Fixed
+
+- `[agy] [edit]` copy-back now stages all files and uses a journalled rename
+  commit with rollback. Failed applies report `edit_rejected:apply_failed` only
+  after restoration; an unrecoverable rollback reports `edit_partial` with an
+  honest applied/restored/unknown/leftovers state. Backup-cleanup failures now
+  also report `edit_partial`, never success; stale transaction files fail before
+  a worker starts, and an interruption before copy-back is terminal.
+- `[agy]` sanitises mounted Git config and masks `FETCH_HEAD`, including for
+  read-only reviews and linked worktrees, so remote credentials are not exposed.
+- `[agy] [edit]` rejects known non-dot CI configuration entrypoints such as
+  `Jenkinsfile` and Azure Pipelines files, and any change inside an existing
+  nested or bare repository (including deletions).
+- Sanitised Git config keeps only allow-listed keys with plain values; the box
+  ignores system Git config (`GIT_CONFIG_NOSYSTEM`, `/etc/gitconfig` blanked).
+
 ## 0.4.0 — Antigravity offload backends
 
 ### Shipped read-only

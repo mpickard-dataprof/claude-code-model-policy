@@ -1110,8 +1110,12 @@ agy_route '[agy]' 'review without a worktree path' "$PARENT_CWD"
 assert "[agy] with zero worktree paths stays read-only" "read-only|$PARENT_CWD" "$(agy_grant_access_cwd)"
 EDIT_ON_POLICY="$SANDBOX/edit-on-policy.json"
 "$NODE" -e 'const fs=require("fs"),p=JSON.parse(fs.readFileSync(process.argv[1]));p.agy.editEnabled=true;fs.writeFileSync(process.argv[2],JSON.stringify(p))' "$DIR/policy.json" "$EDIT_ON_POLICY"
+EDIT_OFF_ROUTE_POLICY="$SANDBOX/edit-off-route-policy.json"
+"$NODE" -e 'const fs=require("fs"),p=JSON.parse(fs.readFileSync(process.argv[1]));p.agy.editEnabled=false;fs.writeFileSync(process.argv[2],JSON.stringify(p))' "$DIR/policy.json" "$EDIT_OFF_ROUTE_POLICY"
+agy_route '[agy] [edit]' "review $WT_ONE" "$PARENT_CWD" "$EDIT_OFF_ROUTE_POLICY"
+assert "editEnabled false keeps [agy] [edit] read-only" "read-only|$PARENT_CWD" "$(agy_grant_access_cwd)"
 agy_route '[agy] [edit]' "review $WT_ONE" "$PARENT_CWD"
-assert "shipped policy keeps [agy] [edit] read-only (edit is off)" "read-only|$PARENT_CWD" "$(agy_grant_access_cwd)"
+assert "shipped policy grants [agy] [edit] edit access" "edit|$WT_ONE" "$(agy_grant_access_cwd)"
 agy_route '[agy] [edit]' "review $WT_ONE" "$PARENT_CWD" "$EDIT_ON_POLICY"
 assert "[agy] [edit] with one worktree root gets edit access" "edit|$WT_ONE" "$(agy_grant_access_cwd)"
 agy_route '[agy]' "review $WT_ONE" "$PARENT_CWD"
@@ -1172,7 +1176,7 @@ assert "codex.tagFrom is honoured" codex "$(printf '%s' "$(agent "$S_AGY" '"suba
 AGY_HOME="$SANDBOX/agy-home"
 FAKE_AGY="$AGY_HOME/.local/bin/agy"
 mkdir -p "$(dirname "$FAKE_AGY")"
-printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\\n" "$@" > "${AGY_ARGV_LOG:-/dev/null}"' 'if [ -n "${AGY_EDIT_ACTION:-}" ]; then eval "$AGY_EDIT_ACTION"; fi' 'if [ -n "${AGY_PLANT_NESTED:-}" ]; then mkdir -p "$PWD/nested/.git"; fi' 'if [ -n "${AGY_SYMLINK_TARGET:-}" ]; then ln -sf "$AGY_SYMLINK_TARGET" /relay/answer.md 2>/dev/null || true; fi' 'if [ -n "${AGY_BIG_ANSWER:-}" ]; then head -c 205000 /dev/zero | tr "\\0" x; else case "$*" in *PERMDENY*) printf "jetski: no output produced\\n" ;; *) printf "AGY-ANSWER\\n" ;; esac; fi' > "$FAKE_AGY"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\\n" "$@" > "${AGY_ARGV_LOG:-/dev/null}"' 'if [ -n "${AGY_SLEEP:-}" ]; then sleep "$AGY_SLEEP"; fi' 'if [ -n "${AGY_EDIT_ACTION:-}" ]; then eval "$AGY_EDIT_ACTION"; fi' 'if [ -n "${AGY_PLANT_NESTED:-}" ]; then mkdir -p "$PWD/nested/.git"; fi' 'if [ -n "${AGY_SYMLINK_TARGET:-}" ]; then ln -sf "$AGY_SYMLINK_TARGET" /relay/answer.md 2>/dev/null || true; fi' 'if [ -n "${AGY_BIG_ANSWER:-}" ]; then head -c 205000 /dev/zero | tr "\\0" x; else case "$*" in *PERMDENY*) printf "jetski: no output produced\\n" ;; *) printf "AGY-ANSWER\\n" ;; esac; fi' > "$FAKE_AGY"
 chmod +x "$FAKE_AGY"
 AGY_POLICY="$SANDBOX/agy-policy.json"
 "$NODE" -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));p.agy.binary=process.argv[2];fs.writeFileSync(process.argv[3],JSON.stringify(p));' "$DIR/policy.json" "$FAKE_AGY" "$AGY_POLICY"
@@ -1226,21 +1230,82 @@ print(h.hexdigest())
 PY
 }
 json_reason() { printf '%s' "$1" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).reason||"")}catch{}})'; }
+no_agy_transaction_files() { python3 - "$1" <<'PY'
+import os,sys
+for root,ds,fs in os.walk(sys.argv[1]):
+ if any(n.startswith(('.agy-stage-','.agy-bak-')) for n in fs): print('no'); break
+else: print('yes')
+PY
+}
 OFF_POLICY="$SANDBOX/edit-off-policy.json"; "$NODE" -e 'const fs=require("fs"),p=JSON.parse(fs.readFileSync(process.argv[1]));delete p.agy.editEnabled;fs.writeFileSync(process.argv[2],JSON.stringify(p))' "$AGY_POLICY" "$OFF_POLICY"
 WT_OFF="$(edit_wt edit-off)"; before="$(tree_hash "$WT_OFF")"; G_OFF="$(printf '%048x' 3999)"; grant "$G_OFF" thirdparty claude-sonnet-4-6 edit "$WT_OFF" 'edit while off'
 out="$(AGY_POLICY="$OFF_POLICY" AGY_EDIT_ACTION='printf changed > base.txt' agy_wrap --grant "$G_OFF")"
 assert "wrapper refuses edit grants unless policy enables edit" "edit_disabled|$before" "$(json_reason "$out")|$(tree_hash "$WT_OFF")"
 WT_EDIT="$(edit_wt edit-ok)"; G1=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 grant "$G1" thirdparty claude-sonnet-4-6 edit "$WT_EDIT" 'edit ordinary files'
-out="$(AGY_EDIT_ACTION='printf changed\\n > base.txt; mkdir -p src; printf new\\n > src/new.txt; rm delete.txt' agy_wrap --grant "$G1")"
-assert "edit copy applies ordinary add modify delete" yes "$(printf '%s' "$out" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const x=JSON.parse(s);process.stdout.write(x.ok&&x.changes.added.includes("src/new.txt")&&x.changes.modified.includes("base.txt")&&x.changes.deleted.includes("delete.txt")?"yes":"no")}catch{process.stdout.write("no")}})')"
+out="$(AGY_EDIT_ACTION='printf changed\\n > base.txt; printf root\\n > added.txt; mkdir -p src; printf new\\n > src/new.txt; rm delete.txt' agy_wrap --grant "$G1")"
+assert "edit transaction applies modify two adds and delete" yes "$(printf '%s' "$out" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const x=JSON.parse(s);process.stdout.write(x.ok&&x.changes.added.includes("added.txt")&&x.changes.added.includes("src/new.txt")&&x.changes.modified.includes("base.txt")&&x.changes.deleted.includes("delete.txt")?"yes":"no")}catch{process.stdout.write("no")}})')"
+assert "successful edit transaction removes stage and backup files" yes "$(no_agy_transaction_files "$WT_EDIT")"
 assert "edit never binds real worktree rw" yes "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n"),p=process.argv[2];process.stdout.write(a.some((x,i)=>x==="--bind"&&a[i+1]===p&&a[i+2]==="/workspace")?"no":"yes")' "$BWRAP_LOG" "$WT_EDIT")"
 assert "edit copy is removed after run" yes "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n");const i=a.findIndex((x,j)=>x==="--bind"&&a[j+2]==="/workspace");process.stdout.write(i>=0&&!require("fs").existsSync(a[i+1])?"yes":"no")' "$BWRAP_LOG")"
 assert "agy edit mode passes accept-edits" yes "$(grep -qx -- '--mode' "$AGY_LOG" && echo yes || echo no)"
+: > "$AGY_LOG"; WT_INTERRUPT="$(edit_wt txn-interrupt)"; interrupt_before="$(tree_hash "$WT_INTERRUPT")"; G_INTERRUPT="$(printf '%048x' 4999)"; grant "$G_INTERRUPT" thirdparty claude-sonnet-4-6 edit "$WT_INTERRUPT" 'interrupt edit'
+env HOME="$AGY_HOME" MODEL_POLICY_POLICY="$AGY_POLICY" AGY_ARGV_LOG="$AGY_LOG" BWRAP_ARGV_LOG="$BWRAP_LOG" MODEL_POLICY_AGY_OUTBASE="$SANDBOX" AGY_SLEEP=10 bash "$DIR/bin/agy-relay.sh" --grant "$G_INTERRUPT" > "$SANDBOX/interrupt.out" 2>&1 & interrupt_pid=$!
+# Signal only once the worker is really running (fake agy writes its argv log
+# first); a fixed sleep raced the wrapper's own startup under load.
+for _ in $(seq 100); do [ -s "$AGY_LOG" ] && break; sleep 0.1; done; kill -TERM "$interrupt_pid"; wait "$interrupt_pid"; interrupt_status=$?
+interrupt_out="$(sed -n '1p' "$SANDBOX/interrupt.out")"
+assert "SIGTERM during an edit run is terminal and leaves the host tree unchanged" yes "$(if [ "$interrupt_status" -ne 0 ] && [ "$(json_reason "$interrupt_out")" = interrupted ] && [ "$interrupt_before" = "$(tree_hash "$WT_INTERRUPT")" ]; then echo yes; else echo no; fi)"
+assert "SIGTERM during an edit run removes its private copy" yes "$(find "$SANDBOX" -maxdepth 1 -type d -name 'agy-edit.*' -print -quit | grep -q . && echo no || echo yes)"
+WT_COPY_MISSING="$(edit_wt txn-copy-missing)"; before="$(tree_hash "$WT_COPY_MISSING")"; G_COPY_MISSING="$(printf '%048x' 5009)"; grant "$G_COPY_MISSING" thirdparty claude-sonnet-4-6 edit "$WT_COPY_MISSING" 'missing copy'
+out="$(MODEL_POLICY_AGY_TEST_DROP_COPY=1 AGY_EDIT_ACTION='printf changed\\n > base.txt' agy_wrap --grant "$G_COPY_MISSING")"
+assert "missing edit copy is rejected before diffing and changes nothing" yes "$(if [[ "$(json_reason "$out")" == edit_rejected:copy_missing:* ]] && [ "$before" = "$(tree_hash "$WT_COPY_MISSING")" ]; then echo yes; else echo no; fi)"
+EDIT_TXN_ACTION='printf changed\\n > base.txt; printf root\\n > added.txt; mkdir -p src; printf new\\n > src/new.txt; rm delete.txt'
+for n in 1 2 3 4 5; do
+  wt="$(edit_wt "txn-fail-$n")"; before="$(tree_hash "$wt")"; id="$(printf '%048x' "$((5000+n))")"; grant "$id" thirdparty claude-sonnet-4-6 edit "$wt" "transaction failure $n"
+  out="$(MODEL_POLICY_AGY_FAIL_AT="$n" AGY_EDIT_ACTION="$EDIT_TXN_ACTION" agy_wrap --grant "$id")"
+  assert "edit commit failure $n rolls back fully" yes "$(r="$(json_reason "$out")"; [[ "$r" == edit_rejected:apply_failed:* && "$before" = "$(tree_hash "$wt")" && ! -e "$wt/src" && "$(no_agy_transaction_files "$wt")" = yes ]] && echo yes || echo no)"
+done
+WT_STAGE="$(edit_wt txn-stage)"; mkdir -p "$WT_STAGE/locked"; chmod 555 "$WT_STAGE/locked"; before="$(tree_hash "$WT_STAGE")"; G_STAGE="$(printf '%048x' 5010)"; grant "$G_STAGE" thirdparty claude-sonnet-4-6 edit "$WT_STAGE" 'stage failure'
+out="$(AGY_EDIT_ACTION='printf changed\\n > base.txt; mkdir -p locked; printf new\\n > locked/new.txt' agy_wrap --grant "$G_STAGE")"; chmod 755 "$WT_STAGE/locked"
+assert "edit staging failure leaves host unchanged" yes "$(r="$(json_reason "$out")"; [[ "$r" == edit_rejected:apply_failed:* && "$before" = "$(tree_hash "$WT_STAGE")" && "$(no_agy_transaction_files "$WT_STAGE")" = yes ]] && echo yes || echo no)"
+WT_PARTIAL="$(edit_wt txn-partial)"; G_PARTIAL="$(printf '%048x' 5011)"; grant "$G_PARTIAL" thirdparty claude-sonnet-4-6 edit "$WT_PARTIAL" 'rollback failure'
+out="$(MODEL_POLICY_AGY_FAIL_AT=2 MODEL_POLICY_AGY_FAIL_ROLLBACK=1 AGY_EDIT_ACTION="$EDIT_TXN_ACTION" agy_wrap --grant "$G_PARTIAL")"
+assert "edit rollback failure reports an honest partial state" yes "$(printf '%s' "$out" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const x=JSON.parse(s);process.stdout.write(x.reason==="edit_partial"&&x.partial&&Array.isArray(x.partial.applied)&&Array.isArray(x.partial.restored)&&Array.isArray(x.partial.unknown)&&Array.isArray(x.partial.leftovers)?"yes":"no")}catch{process.stdout.write("no")}})')"
+WT_BAK_UNLINK="$(edit_wt txn-bak-unlink)"; G_BAK_UNLINK="$(printf '%048x' 5013)"; grant "$G_BAK_UNLINK" thirdparty claude-sonnet-4-6 edit "$WT_BAK_UNLINK" 'backup unlink failure'
+out="$(MODEL_POLICY_AGY_FAIL_BAK_UNLINK=1 AGY_EDIT_ACTION='printf changed\\n > base.txt' agy_wrap --grant "$G_BAK_UNLINK")"
+assert "backup cleanup failure reports edit_partial with every applied path" yes "$(printf '%s' "$out" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const x=JSON.parse(s);process.stdout.write(x.reason==="edit_partial"&&x.partial?.applied?.includes("base.txt")&&x.partial?.leftovers?.some(p=>p.startsWith(".agy-bak-"))?"yes":"no")}catch{process.stdout.write("no")}})')"
+rm -f "$WT_BAK_UNLINK"/.agy-bak-*
+WT_PRE_LEFTOVER="$(edit_wt txn-pre-leftover)"; printf stale > "$WT_PRE_LEFTOVER/.agy-bak-x"; G_PRE_LEFTOVER="$(printf '%048x' 5014)"; grant "$G_PRE_LEFTOVER" thirdparty claude-sonnet-4-6 edit "$WT_PRE_LEFTOVER" 'pre-existing leftovers'; rm -f "$AGY_LOG"
+out="$(agy_wrap --grant "$G_PRE_LEFTOVER")"
+assert "pre-existing transaction leftovers reject before the worker launches" yes "$(state="$(printf '%s' "$out" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const x=JSON.parse(s);process.stdout.write(x.reason==="edit_leftovers_present"&&x.leftovers?.includes(".agy-bak-x")?"yes":"no")}catch{process.stdout.write("no")}})')"; [ "$state" = yes ] && [ ! -e "$AGY_LOG" ] && echo yes || echo no)"
+rm -f "$WT_PRE_LEFTOVER/.agy-bak-x"
+WT_CRASH="$(edit_wt txn-crash)"; G_CRASH="$(printf '%048x' 5012)"; grant "$G_CRASH" thirdparty claude-sonnet-4-6 edit "$WT_CRASH" 'copy-back crash'
+out="$(MODEL_POLICY_AGY_FAIL_AT=not-a-number AGY_EDIT_ACTION="$EDIT_TXN_ACTION" agy_wrap --grant "$G_CRASH")"
+assert "a crashed copy-back reports unknown state, never rejected" edit_state_unknown "$(json_reason "$out")"
+WT_BOX_HOOK="$(edit_wt txn-box-hook)"; G_BOX_HOOK="$(printf '%048x' 5012)"; grant "$G_BOX_HOOK" thirdparty claude-sonnet-4-6 edit "$WT_BOX_HOOK" 'box hooks ignored'
+out="$(AGY_EDIT_ACTION='export MODEL_POLICY_AGY_FAIL_AT=1 MODEL_POLICY_AGY_FAIL_ROLLBACK=1; printf changed\\n > base.txt; printf root\\n > added.txt; mkdir -p src; printf new\\n > src/new.txt; rm delete.txt' agy_wrap --grant "$G_BOX_HOOK")"
+assert "edit worker fault-injection exports have no host effect" yes "$(printf '%s' "$out" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const x=JSON.parse(s);process.stdout.write(x.ok&&x.changes.added.length===2&&x.changes.modified.length===1&&x.changes.deleted.length===1?"yes":"no")}catch{process.stdout.write("no")}})')"
 for spec in symlink:'ln -s base.txt evil.txt' hardlink:'ln base.txt linked.txt' dotdir:'mkdir -p .github/workflows; printf x > .github/workflows/x.yml' instruction:'mkdir -p sub; printf x > sub/CLAUDE.md' mode:'chmod +x base.txt' huge:'head -c $((5*1024*1024+1)) /dev/zero > huge.txt' hookdot:'mkdir -p x/.hooks; printf x > x/.hooks/y' baregit:'mkdir -p sub/r.git; printf x > sub/r.git/config' bareshape:'mkdir -p vendor/r/objects vendor/r/refs/heads; printf x > vendor/r/HEAD; printf x > vendor/r/config' filedir:'rm base.txt; mkdir base.txt'; do
   name="${spec%%:*}"; action="${spec#*:}"; wt="$(edit_wt "reject-$name")"; before="$(tree_hash "$wt")"; REJ_N=$((${REJ_N:-0}+1)); id="$(printf '%048x' "$((4000+REJ_N))")"; grant "$id" thirdparty claude-sonnet-4-6 edit "$wt" "reject $name"; out="$(AGY_EDIT_ACTION="$action" agy_wrap --grant "$id")"; after="$(tree_hash "$wt")"; assert "edit rejects $name atomically" yes "$(r="$(json_reason "$out")"; [[ "$r" == edit_rejected:* && "$before" = "$after" ]] && echo yes || echo no)";
 done
 assert "edit rejection identifies its rule and offending path" yes "$(printf '%s' "$out" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const x=JSON.parse(s);process.stdout.write(x.rejected?.rule==="non_regular"&&x.rejected?.path==="base.txt"?"yes":"no")}catch{process.stdout.write("no")}})')"
+WT_CI="$(edit_wt reject-ci-names)"; before="$(tree_hash "$WT_CI")"; G_CI="$(printf '%048x' 4988)"; grant "$G_CI" thirdparty claude-sonnet-4-6 edit "$WT_CI" 'CI config names'
+out="$(AGY_EDIT_ACTION='printf x > Jenkinsfile; printf x > azure-pipelines.yml' agy_wrap --grant "$G_CI")"
+assert "known CI config names are rejected atomically" yes "$(if [[ "$(json_reason "$out")" == edit_rejected:path:* ]] && [ "$before" = "$(tree_hash "$WT_CI")" ]; then echo yes; else echo no; fi)"
+# Round 7: a pre-existing (tracked) bare repo may not be edited, even by deletion.
+WT_BARE_DEL="$(edit_wt bare-delete)"; mkdir -p "$WT_BARE_DEL/vendor/r/objects" "$WT_BARE_DEL/vendor/r/refs"; printf 'ref: refs/heads/main\n' > "$WT_BARE_DEL/vendor/r/HEAD"; printf x > "$WT_BARE_DEL/vendor/r/config"; printf x > "$WT_BARE_DEL/vendor/r/objects/keep"; printf x > "$WT_BARE_DEL/vendor/r/refs/keep"; git -C "$WT_BARE_DEL" add . && git -C "$WT_BARE_DEL" commit -qm bare
+bare_before="$(tree_hash "$WT_BARE_DEL")"; G_BARE_DEL="$(printf '%048x' 5013)"; grant "$G_BARE_DEL" thirdparty claude-sonnet-4-6 edit "$WT_BARE_DEL" 'bare delete'
+out="$(AGY_EDIT_ACTION='rm vendor/r/config' agy_wrap --grant "$G_BARE_DEL")"
+assert "deleting inside an existing bare repo is rejected" "edit_rejected:git_repo:vendor/r/config|$bare_before" "$(json_reason "$out")|$(tree_hash "$WT_BARE_DEL")"
+G_BARE_HEAD="$(printf '%048x' 5014)"; grant "$G_BARE_HEAD" thirdparty claude-sonnet-4-6 edit "$WT_BARE_DEL" 'bare head delete'
+out="$(AGY_EDIT_ACTION='rm vendor/r/HEAD' agy_wrap --grant "$G_BARE_HEAD")"
+assert "deleting a bare repo's HEAD marker is rejected" "edit_rejected:git_repo:vendor/r/HEAD|$bare_before" "$(json_reason "$out")|$(tree_hash "$WT_BARE_DEL")"
+WT_NESTED="$(edit_wt nested-repo)"; mkdir -p "$WT_NESTED/sub"; printf x > "$WT_NESTED/sub/file.txt"; git -C "$WT_NESTED" add . && git -C "$WT_NESTED" commit -qm sub; git init -q "$WT_NESTED/sub"
+nested_before="$(tree_hash "$WT_NESTED")"; G_NESTED="$(printf '%048x' 5015)"; grant "$G_NESTED" thirdparty claude-sonnet-4-6 edit "$WT_NESTED" 'nested repo edit'
+out="$(AGY_EDIT_ACTION='printf changed > sub/file.txt' agy_wrap --grant "$G_NESTED")"
+assert "editing inside an existing nested repo is rejected" "edit_rejected:git_repo:sub/file.txt|$nested_before" "$(json_reason "$out")|$(tree_hash "$WT_NESTED")"
+assert "git in the box ignores system git config" yes "$(grep -A1 -x -- '--setenv' "$BWRAP_LOG" | grep -qx GIT_CONFIG_NOSYSTEM && echo yes || echo no)"
 WT_CONFLICT="$(edit_wt reject-conflict)"; G_CONFLICT=abababababababababababababababababababababababab
 grant "$G_CONFLICT" thirdparty claude-sonnet-4-6 edit "$WT_CONFLICT" 'conflict'
 out="$(AGY_EDIT_ACTION="printf copy > base.txt; printf host > '$WT_CONFLICT/base.txt'" agy_wrap --grant "$G_CONFLICT")"
@@ -1295,6 +1360,21 @@ git -C "$GIT_MAIN" add tracked.txt
 git -C "$GIT_MAIN" commit -qm initial
 git -C "$GIT_MAIN" worktree add -q "$GIT_WT" -b agy-test-worktree
 GIT_COMMON="$(git -C "$GIT_WT" rev-parse --path-format=absolute --git-common-dir)"
+GIT_WT_DIR="$(git -C "$GIT_WT" rev-parse --absolute-git-dir)"
+git -C "$GIT_MAIN" config remote.origin.url https://user:SECRETTOKEN@example.invalid/r.git
+# Values that smuggle a URL through allow-listed-looking keys (round 7).
+git -C "$GIT_MAIN" config branch.main.remote https://user:SECRETTOKEN@example.invalid/r.git; git -C "$GIT_MAIN" config extensions.partialclone https://user:SECRETTOKEN@example.invalid/r.git
+printf 'SECRETTOKEN\n' > "$GIT_COMMON/FETCH_HEAD"
+printf '[remote "origin"]\n\turl = https://user:SECRETTOKEN@example.invalid/r.git\n' > "$GIT_COMMON/config.worktree"
+printf '[remote "origin"]\n\turl = https://user:SECRETTOKEN@example.invalid/r.git\n' > "$GIT_WT_DIR/config.worktree"
+GIT_NORMAL="$SANDBOX/agy-git-normal"; git init -q "$GIT_NORMAL"; git -C "$GIT_NORMAL" config user.email test@example.invalid; git -C "$GIT_NORMAL" config user.name test; printf normal > "$GIT_NORMAL/normal.txt"; git -C "$GIT_NORMAL" add normal.txt && git -C "$GIT_NORMAL" commit -qm initial
+git -C "$GIT_NORMAL" config remote.origin.url https://user:SECRETTOKEN@example.invalid/r.git
+git -C "$GIT_NORMAL" config branch.main.remote https://user:SECRETTOKEN@example.invalid/r.git
+printf 'SECRETTOKEN\n' > "$GIT_NORMAL/.git/FETCH_HEAD"
+git_metadata_overlays_safe() { "$NODE" -e 'const fs=require("fs"),a=fs.readFileSync(process.argv[1],"utf8").trim().split("\n"),targets=process.argv.slice(2);let ok=true;for(const t of targets){const i=a.findIndex((x,j)=>x==="--ro-bind"&&a[j+2]===t);if(i<0){ok=false;continue}const s=fs.readFileSync(a[i+1],"utf8");if(s.includes("SECRETTOKEN"))ok=false;if(t.endsWith("/config")&&!s.includes("repositoryformatversion"))ok=false}process.stdout.write(ok?"yes":"no")' "$BWRAP_LOG" "$@"; }
+G_NORMAL_META="$(printf '%048x' 4010)"; grant "$G_NORMAL_META" thirdparty claude-sonnet-4-6 read-only "$GIT_NORMAL" 'normal git metadata'
+out="$(agy_wrap --grant "$G_NORMAL_META")"
+assert "normal read-only git metadata overlays remove credentials and retain core config" yes "$(git_metadata_overlays_safe /workspace/.git/config /workspace/.git/FETCH_HEAD)"
 G4=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 grant "$G4" thirdparty claude-sonnet-4-6 read-only "$GIT_WT" 'read only task'
 out="$(agy_wrap --grant "$G4")"
@@ -1315,6 +1395,10 @@ assert "read-only grant binds cwd read-only" yes \
   "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n"),p=process.argv[2];process.stdout.write(a.some((x,i)=>x==="--ro-bind"&&a[i+1]===p&&a[i+2]==="/workspace")?"yes":"no")' "$BWRAP_LOG" "$GIT_WT")"
 assert "linked worktree common git dir is read-only bound" yes \
   "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n"),p=process.argv[2];process.stdout.write(a.some((x,i)=>x==="--ro-bind"&&a[i+1]===p&&a[i+2]===p)?"yes":"no")' "$BWRAP_LOG" "$GIT_COMMON")"
+assert "linked read-only git metadata overlays remove credentials and retain core config" yes "$(git_metadata_overlays_safe "$GIT_COMMON/config" "$GIT_COMMON/FETCH_HEAD" "$GIT_COMMON/config.worktree" "$GIT_WT_DIR/config.worktree")"
+G_LINKED_META_EDIT="$(printf '%048x' 4011)"; grant "$G_LINKED_META_EDIT" thirdparty claude-sonnet-4-6 edit "$GIT_WT" 'linked edit metadata'
+out="$(agy_wrap --grant "$G_LINKED_META_EDIT")"
+assert "linked edit git metadata overlays remove credentials and retain core config" yes "$(git_metadata_overlays_safe "$GIT_COMMON/config" "$GIT_COMMON/FETCH_HEAD" "$GIT_COMMON/config.worktree" "$GIT_WT_DIR/config.worktree")"
 OTHER_GIT="$SANDBOX/other-private"; BAD_GIT="$SANDBOX/.worktrees/bad-chain"
 git init -q "$OTHER_GIT"; mkdir -p "$BAD_GIT"; printf 'gitdir: %s/.git\n' "$OTHER_GIT" > "$BAD_GIT/.git"
 G_BAD_CHAIN=edededededededededededededededededededededededed
@@ -1328,8 +1412,8 @@ assert "read-only grant has no writable checkout bind" yes \
   "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n");process.stdout.write(a.some((x,i)=>x==="--bind"&&a[i+2]==="/workspace")?"no":"yes")' "$BWRAP_LOG")"
 assert "bwrap never mounts /run and isolates IPC/process/session/UTS" yes \
   "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n"),opts=["--unshare-ipc","--unshare-pid","--new-session","--unshare-uts","--clearenv"];const run=a.some((x,i)=>(x==="--bind"||x==="--ro-bind")&&a[i+1]==="/run"&&a[i+2]==="/run");process.stdout.write(!run&&opts.every(x=>a.includes(x))?"yes":"no")' "$BWRAP_LOG")"
-assert "bwrap keeps only the five approved environment variables" yes \
-  "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n"),got=[];for(let i=0;i<a.length;i++)if(a[i]==="--setenv")got.push(a[i+1]);process.stdout.write(a.includes("--clearenv")&&got.sort().join(",")==="HOME,LANG,PATH,TERM,TZ"?"yes":"no")' "$BWRAP_LOG")"
+assert "bwrap keeps only the six approved environment variables" yes \
+  "$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n"),got=[];for(let i=0;i<a.length;i++)if(a[i]==="--setenv")got.push(a[i+1]);process.stdout.write(a.includes("--clearenv")&&got.sort().join(",")==="GIT_CONFIG_NOSYSTEM,HOME,LANG,PATH,TERM,TZ"?"yes":"no")' "$BWRAP_LOG")"
 RESOLV_TARGET_TEST="$(realpath /etc/resolv.conf 2>/dev/null || true)"
 if [ -n "$RESOLV_TARGET_TEST" ] && [ -f "$RESOLV_TARGET_TEST" ]; then
   assert "DNS exposes only resolved resolv.conf file" yes \
