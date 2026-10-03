@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.2 — agy works in projects with a `.claude/` folder
+
+- agy no longer refuses a working folder that directly contains `.claude*`,
+  `.gemini` or `.ssh`. Most projects have `.claude/`, so `[gemini]`/`[agy]`
+  silently fell back to native routing there. Those entries are now hidden inside
+  the sandbox (empty tmpfs or `/dev/null`) and left out of edit copies; a
+  symlinked one still refuses the folder.
+- A direct `agy` spawn that cannot get a grant is now denied with its cause,
+  instead of starting a relay that fails with "missing gate-issued grant".
+
 ## 0.4.1 — `[agy] [edit]` enabled
 
 - `[agy] [edit]` is **on** (`agy.editEnabled: true`) after review rounds 5-8.

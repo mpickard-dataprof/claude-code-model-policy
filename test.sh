@@ -1128,10 +1128,16 @@ agy_route '[agy]' "review $SUBSTRING_WT" "$PARENT_CWD"
 assert "worktrees as a substring is not edit access" "read-only|$PARENT_CWD" "$(agy_grant_access_cwd)"
 agy_route '[agy] [edit]' "review $LINK_WT" "$PARENT_CWD" "$EDIT_ON_POLICY"
 assert "a symlink into one worktree gets resolved edit access" "edit|$WT_ONE" "$(agy_grant_access_cwd)"
-UNSAFE_CWD="$SANDBOX/unsafe-cwd"; mkdir -p "$UNSAFE_CWD/.ssh"
+MASKED_CWD="$SANDBOX/masked-cwd"; mkdir -p "$MASKED_CWD/.claude" "$MASKED_CWD/.ssh"
+agy_route '[agy]' 'review safely' "$MASKED_CWD"
+assert "cwd with .claude/.ssh routes to agy (masked in the box)" agy "$AGY_ROUTE_TYPE"
+UNSAFE_CWD="$SANDBOX/unsafe-cwd"; mkdir -p "$UNSAFE_CWD"; ln -s "$SANDBOX" "$UNSAFE_CWD/.claude"
 agy_route '[agy]' 'review safely' "$UNSAFE_CWD"
-assert "secret-bearing cwd falls back to native routing" general-purpose \
+assert "symlinked .claude cwd falls back to native routing" general-purpose \
   "$(printf '%s' "$AGY_ROUTE_OUT" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).hookSpecificOutput.updatedInput.subagent_type)}catch{process.stdout.write("general-purpose")}})')"
+direct_agy() { "$NODE" -e 'process.stdout.write(JSON.stringify({session_id:process.argv[1],tool_use_id:"agy-direct",hook_event_name:"PreToolUse",tool_name:"Agent",cwd:process.argv[2],tool_input:{subagent_type:"agy",description:"[gemini] review",prompt:"review it"}}))' "$S_AGY" "$1" | env MODEL_POLICY_POLICY="$DIR/policy.json" sh "$RUN" "$GATE" 2>/dev/null | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const h=JSON.parse(s).hookSpecificOutput;process.stdout.write(h.permissionDecision==="deny"?"DENY:"+(/cannot run because/.test(h.permissionDecisionReason)?"reason":"other"):(h.updatedInput?.prompt?.match(/grant: [a-f0-9]{48}/)?"GRANT":"NOGRANT"))}catch{process.stdout.write("NOOP")}})'; }
+assert "direct agy spawn from a disallowed cwd is denied with its cause" DENY:reason "$(direct_agy "$HOME")"
+assert "direct agy spawn from a .claude project gets a grant" GRANT "$(direct_agy "$MASKED_CWD")"
 agy_route '[agy]' 'review safely' "$HOME"
 assert "home cwd falls back to native routing" general-purpose \
   "$(printf '%s' "$AGY_ROUTE_OUT" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).hookSpecificOutput.updatedInput.subagent_type)}catch{process.stdout.write("general-purpose")}})')"
@@ -1305,6 +1311,10 @@ WT_NESTED="$(edit_wt nested-repo)"; mkdir -p "$WT_NESTED/sub"; printf x > "$WT_N
 nested_before="$(tree_hash "$WT_NESTED")"; G_NESTED="$(printf '%048x' 5015)"; grant "$G_NESTED" thirdparty claude-sonnet-4-6 edit "$WT_NESTED" 'nested repo edit'
 out="$(AGY_EDIT_ACTION='printf changed > sub/file.txt' agy_wrap --grant "$G_NESTED")"
 assert "editing inside an existing nested repo is rejected" "edit_rejected:git_repo:sub/file.txt|$nested_before" "$(json_reason "$out")|$(tree_hash "$WT_NESTED")"
+WT_CLAUDE="$(edit_wt with-claude)"; mkdir -p "$WT_CLAUDE/.claude"; printf '{}' > "$WT_CLAUDE/.claude/settings.json"; git -C "$WT_CLAUDE" add . && git -C "$WT_CLAUDE" commit -qm claude
+claude_before="$(tree_hash "$WT_CLAUDE")"; G_CLAUDE="$(printf '%048x' 6003)"; grant "$G_CLAUDE" thirdparty claude-sonnet-4-6 edit "$WT_CLAUDE" 'edit beside .claude'
+out="$(AGY_EDIT_ACTION='if [ -e .claude ]; then printf saw > saw_claude.txt; fi' agy_wrap --grant "$G_CLAUDE")"
+assert "edit copy omits .claude and leaves it untouched" "true|$claude_before" "$(printf '%s' "$out" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String(JSON.parse(s).ok))}catch{process.stdout.write("bad")}})')|$(tree_hash "$WT_CLAUDE")"
 assert "git in the box ignores system git config" yes "$(grep -A1 -x -- '--setenv' "$BWRAP_LOG" | grep -qx GIT_CONFIG_NOSYSTEM && echo yes || echo no)"
 WT_CONFLICT="$(edit_wt reject-conflict)"; G_CONFLICT=abababababababababababababababababababababababab
 grant "$G_CONFLICT" thirdparty claude-sonnet-4-6 edit "$WT_CONFLICT" 'conflict'
@@ -1325,6 +1335,11 @@ assert "edit grant without a top-level .git is refused" grant_invalid "$(agy_wra
 G_BAD_CWD=acacacacacacacacacacacacacacacacacacacacacacacac
 grant "$G_BAD_CWD" thirdparty claude-sonnet-4-6 read-only "$AGY_HOME" 'bad cwd'
 assert "wrapper refuses a secret-bearing cwd" cwd_not_allowed "$(agy_wrap --grant "$G_BAD_CWD" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).reason)}catch{}})')"
+MASK_DIR="$SANDBOX/mask-review"; mkdir -p "$MASK_DIR/.claude" "$MASK_DIR/.claude-work"; printf 'k' > "$MASK_DIR/.ssh"; G_MASK="$(printf '%048x' 6001)"; grant "$G_MASK" thirdparty claude-sonnet-4-6 read-only "$MASK_DIR" 'masked review'
+out="$(agy_wrap --grant "$G_MASK")"
+assert "read-only run masks .claude*/.ssh children of the workspace" "true|yes" "$(printf '%s' "$out" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String(JSON.parse(s).ok))}catch{process.stdout.write("bad")}})')|$("$NODE" -e 'const a=require("fs").readFileSync(process.argv[1],"utf8").trim().split("\n");const t=(f,d)=>a.some((x,i)=>x===f&&a[i+(f==="--tmpfs"?1:2)]===d);process.stdout.write(t("--tmpfs","/workspace/.claude")&&t("--tmpfs","/workspace/.claude-work")&&t("--ro-bind","/workspace/.ssh")?"yes":"no")' "$BWRAP_LOG")"
+LINK_DIR="$SANDBOX/link-review"; mkdir -p "$LINK_DIR"; ln -s "$AGY_HOME" "$LINK_DIR/.claude"; G_LINK="$(printf '%048x' 6002)"; grant "$G_LINK" thirdparty claude-sonnet-4-6 read-only "$LINK_DIR" 'symlinked claude'
+assert "wrapper refuses a symlinked .claude child" cwd_not_allowed "$(json_reason "$(agy_wrap --grant "$G_LINK")")"
 mkdir -p "$AGY_HOME/x"
 G_ROOT=babababababababababababababababababababababababa
 G_HOME_PARENT=cacacacacacacacacacacacacacacacacacacacacacacaca

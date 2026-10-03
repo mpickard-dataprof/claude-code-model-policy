@@ -45,7 +45,10 @@ if g['model'] not in set(((a.get('pools') or {}).get(g['pool']) or {}).get('byTi
 cwd=os.path.realpath(g['cwd']); task=os.path.realpath(g['task_path']); base=os.path.realpath(grants)+os.sep
 if not os.path.isdir(cwd) or not task.startswith(base) or not os.path.isfile(task): die('grant_invalid')
 home=os.path.realpath(os.path.expanduser('~'))
-try: secret_child=any(n == '.gemini' or n == '.ssh' or n == '.claude' or n.startswith('.claude') for n in os.listdir(cwd))
+# .claude*, .gemini and .ssh children are masked inside the box (most projects
+# have a .claude/), so they no longer refuse the cwd; only a symlinked one does,
+# because a mount onto a symlink would follow it.
+try: secret_child=any((n in ('.gemini','.ssh') or n.startswith('.claude')) and os.path.islink(os.path.join(cwd,n)) for n in os.listdir(cwd))
 except Exception: secret_child=True
 # Do this by components, not string prefixes: '/' + os.sep is '//', which made
 # the filesystem root skip the old ancestor-of-home check.
@@ -174,6 +177,8 @@ for raw in paths.split(b'\0'):
  rel=os.fsdecode(raw)
  parts=rel.split('/')
  if os.path.isabs(rel) or not rel or any(x in ('','.', '..') for x in parts): bad()
+ # Never copy project Claude/Gemini/SSH material into the box.
+ if parts[0] in ('.gemini','.ssh') or parts[0].startswith('.claude'): continue
  full=os.path.join(src,rel)
  try: st=os.lstat(full)
  except FileNotFoundError: continue
@@ -278,6 +283,14 @@ ARGS+=(--bind "$PRIVTMP" /tmp)
 # The captured realpath is intentionally mounted at a fixed destination: a
 # same-UID rename cannot turn the in-box workspace into a different pathname.
 if [ "$ACCESS" = edit ]; then ARGS+=(--bind "$COPYDIR" /workspace); else ARGS+=(--ro-bind "$CWD" /workspace); fi
+# Hide project-level Claude/Gemini/SSH material: empty tmpfs over directories,
+# /dev/null over files. Edit copies never contain them (see the copy step).
+if [ "$ACCESS" != edit ]; then
+  for n in "$CWD"/.claude* "$CWD/.gemini" "$CWD/.ssh"; do
+    [ -L "$n" ] && fail cwd_not_allowed
+    if [ -d "$n" ]; then ARGS+=(--tmpfs "/workspace/${n##*/}"); elif [ -e "$n" ]; then ARGS+=(--ro-bind /dev/null "/workspace/${n##*/}"); fi
+  done
+fi
 if [ -n "$GIT_COMMON_DIR" ]; then ensure_box_parents "$GIT_COMMON_DIR"; ARGS+=(--ro-bind "$GIT_COMMON_DIR" "$GIT_COMMON_DIR"); fi
 if [ "$ACCESS" = edit ]; then ARGS+=(--ro-bind "$CWD/.git" /workspace/.git); fi
 add_git_overlays() {
