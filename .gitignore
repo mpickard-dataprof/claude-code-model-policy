@@ -5,6 +5,7 @@ ledger.jsonl.*
 diagnostics.jsonl
 sessions/
 usage.json
+usage-*.json
 
 # Installer backups
 *.bak
