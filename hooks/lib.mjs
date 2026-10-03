@@ -4,7 +4,7 @@
 
 import {
   readFileSync, writeFileSync, appendFileSync, statSync, accessSync, constants, renameSync,
-  mkdirSync, readdirSync, unlinkSync, openSync, readSync, closeSync, realpathSync, chmodSync,
+  mkdirSync, readdirSync, lstatSync, unlinkSync, openSync, readSync, closeSync, realpathSync, chmodSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
@@ -350,8 +350,10 @@ export function agyCwdAllowed(cwd) {
     // dir, without confusing /home/me with /home/meaningful.
     if (dirParts.length <= homeParts.length
       && dirParts.every((part, i) => homeParts[i] === part)) return false;
-    return !readdirSync(dir).some((name) => name === '.gemini' || name === '.ssh'
-      || name === '.claude' || name.startsWith('.claude'));
+    // .claude*/.gemini/.ssh children are masked inside the sandbox rather than
+    // refusing the cwd (most projects have .claude/); a symlinked one still refuses.
+    return !readdirSync(dir).some((name) => (name === '.gemini' || name === '.ssh'
+      || name.startsWith('.claude')) && lstatSync(join(dir, name)).isSymbolicLink());
   } catch { return false; }
 }
 

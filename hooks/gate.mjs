@@ -281,6 +281,20 @@ async function main() {
         offload = { ...offload, grantId: grant.id, preamble: agyRelayPreamble(grant.id) };
       }
     }
+    // Naming the relay directly only works with a grant. Without one the relay
+    // would start and fail ("missing grant"), so refuse it here with the cause.
+    if (isAgyRelayType && offloadBackend !== 'agy') {
+      const why = agyCwdRejected
+        ? 'this working folder is not allowed for agy (home or an ancestor of it, too shallow, or a symlinked .claude/.gemini/.ssh)'
+        : 'no grant could be issued for this spawn';
+      ledger({ event: 'route', tool: 'Agent', session_id: input.session_id, tool_use_id: input.tool_use_id,
+        agent_type: currentType, description: String(toolInput.description ?? '').slice(0, 120),
+        rule: 'deny:agy-no-grant', reason: agyCwdRejected ? 'cwd_not_allowed' : 'no_grant', denied: true,
+      }, policy.limits?.ledgerMaxBytes);
+      emit({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny',
+        permissionDecisionReason: `model-policy: the \`agy\` relay cannot run because ${why}. Use a normal agent type instead.` } });
+      return;
+    }
     let effectiveTier = tier;
     if (offload) {
       // The relay agent itself only shells out and reads a file back, so it runs
