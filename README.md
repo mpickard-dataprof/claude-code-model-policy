@@ -135,9 +135,8 @@ Put a tag in the Agent task description to force a tier:
 
 `[gpt]` sends a generic task through the Codex relay. `[gemini]` sends a
 **review only** task through Antigravity's Gemini pool and is always read-only.
-`[agy]` uses Antigravity's third-party pool. **Edit mode is shipped off**
-(`agy.editEnabled: false`), so both pools are read-only reviewers; see below. With it
-on, edits require both `[agy] [edit]` (the tag is configurable as `agy.editTag`) and
+`[agy]` uses Antigravity's third-party pool for reviews or development
+(`agy.editEnabled: true`; set it false to make both pools read-only). Edits require both `[agy] [edit]` (the tag is configurable as `agy.editTag`) and
 one explicit path to a real `<repo>/.worktrees/<name>` Git-worktree root. The gate issues a single-use
 grant and the relay can run only that grant command. Every Antigravity run is
 inside a mandatory Linux `bwrap` sandbox; without bubblewrap the tags are inactive
@@ -164,9 +163,9 @@ access. The agy OAuth token is also readable inside the box so the CLI can work;
 a prompt-injected run could exfiltrate it. That exposure is inherent to this
 offload design—revoke it on the Google side with `agy logout` if needed.
 
-Edit mode remains shipped off (`agy.editEnabled: false`) pending review; the wrapper
-also refuses edit grants while it is off. When enabled for a reviewed deployment,
-copy-back stages every payload in its destination directory, then commits a
+Edit mode is on as of 0.4.1, after review rounds 5-8 (`tasks/reviews/`); with
+`agy.editEnabled: false` the gate issues no edit grants and the wrapper refuses them.
+Copy-back stages every payload in its destination directory, then commits a
 journalled sequence of same-directory renames. A failed commit rolls the whole
 delta back, so `edit_rejected:apply_failed:<path>` means the host tree was restored.
 If rollback itself cannot establish the final state, the result is `edit_partial`

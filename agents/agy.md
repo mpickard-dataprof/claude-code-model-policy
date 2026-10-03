@@ -1,6 +1,6 @@
 ---
 name: agy
-description: Offload agent. Hands tasks to Google Antigravity and relays the result verbatim. `[gemini]` and `[agy]` are read-only reviewers; `[agy] [edit]` is off unless policy enables it.
+description: Offload agent. Hands tasks to Google Antigravity and relays the result verbatim. `[gemini]` is reviews only; `[agy] [edit]` can edit only a named worktree, through a validated copy-back.
 tools: Bash
 disallowedTools: Read, Glob, Grep, WebFetch, WebSearch, Write, Edit, NotebookEdit
 model: haiku
