@@ -4,8 +4,8 @@ Two new offload backends via Google's `agy -p` CLI, parallel to `[gpt]`/Codex.
 
 ## Decisions (owner)
 - Two tags, tag-only by default: `[gemini]` -> agy Gemini pool; `[agy]` -> agy third-party pool (Claude + GPT-OSS).
-- Gemini map: haiku->gemini-3.8-flash-low, sonnet->gemini-3.8-flash-medium, opus->gemini-3.1-pro-high, fable->gemini-3.1-pro-high.
-- Third-party map: haiku->gpt-oss-120b-medium, sonnet->claude-sonnet-4-6, opus->claude-opus-4-6-thinking, fable->claude-opus-4-6-thinking.
+- Gemini map: haiku->gemini-3.8-flash-low, sonnet->gemini-3.8-flash-medium, opus->gemini-3.8-flash-high, fable->gemini-3.8-flash-high.
+- Third-party map: haiku->gpt-oss-120b-medium, sonnet->claude-sonnet-5-5-medium, opus->claude-opus-5-5-high, fable->claude-opus-5-5-high.
 - Roles (owner): `[gemini]` = REVIEWS ONLY, always read-only (never accept-edits, even in a worktree). `[agy]` = reviews + development.
 - Access: read-only by default (agy default perms + read-only allow-list in ~/.gemini/antigravity-cli/settings.json);
   `--mode accept-edits` (file edits, NO shell) only for the `[agy]` pool AND only when cwd is under a `.worktrees/` dir. Never --dangerously-skip-permissions.

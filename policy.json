@@ -155,17 +155,17 @@
         "byTier": {
           "haiku": "gemini-3.8-flash-low",
           "sonnet": "gemini-3.8-flash-medium",
-          "opus": "gemini-3.1-pro-high",
-          "fable": "gemini-3.1-pro-high"
+          "opus": "gemini-3.8-flash-high",
+          "fable": "gemini-3.8-flash-high"
         }
       },
       "thirdparty": {
         "tag": "[agy]",
         "byTier": {
           "haiku": "gpt-oss-120b-medium",
-          "sonnet": "claude-sonnet-4-6",
-          "opus": "claude-opus-4-6-thinking",
-          "fable": "claude-opus-4-6-thinking"
+          "sonnet": "claude-sonnet-5-5-medium",
+          "opus": "claude-opus-5-5-high",
+          "fable": "claude-opus-5-5-high"
         }
       }
     },
