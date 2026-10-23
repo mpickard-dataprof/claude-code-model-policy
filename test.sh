@@ -1080,7 +1080,7 @@ echo "== Antigravity grants: tiers, precedence, access and spill =="
 # the immutable record the gate gave the relay, not the now-removed old preamble.
 for pool in gemini agy; do
   case "$pool" in
-    gemini) tag='[gemini]'; h='gemini-3.8-flash-low'; s='gemini-3.8-flash-medium'; o='gemini-3.8-flash-high'; f='gemini-3.8-flash-high' ;;
+    gemini) tag='[gemini]'; h='gemini-3.8-flash-low'; s='gemini-3.8-flash-medium'; o='gemini-4-argon-high'; f='gemini-4-argon-high' ;;
     agy) tag='[agy]'; h='gpt-oss-120b-medium'; s='claude-sonnet-5-5-medium'; o='claude-opus-5-5-high'; f='claude-opus-5-5-high' ;;
   esac
   agy_route "$tag [cheap]" "review this" "$DIR"

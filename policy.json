@@ -155,8 +155,8 @@
         "byTier": {
           "haiku": "gemini-3.8-flash-low",
           "sonnet": "gemini-3.8-flash-medium",
-          "opus": "gemini-3.8-flash-high",
-          "fable": "gemini-3.8-flash-high"
+          "opus": "gemini-4-argon-high",
+          "fable": "gemini-4-argon-high"
         }
       },
       "thirdparty": {
