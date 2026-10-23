@@ -11,3 +11,4 @@ Every Gemini result is verified independently. One row per task.
 | 2026-10-01 | sandbox write test (self-report) | gemini-3.8-flash-medium | checked disk | NO | claimed "Failed: None" after both writes were blocked by the sandbox -> false success report. Never trust its self-reported outcomes |
 | 2026-10-01 | review in real git worktree (sandboxed, git log + 1-line bug) | gemini-3.8-flash-medium | read file + git log | yes | 15s, ran allowed git log inside bwrap |
 | 2026-10-02 | worktree review via /workspace pinned sandbox | gemini-3.8-flash-medium | read file + git log | yes | 57s; earlier attempt aborted reading git common dir directly (fixed with --add-dir) |
+| 2026-10-22 | smoke review (1-line bug, throwaway dir, direct agy -p on kde-matt, no relay/sandbox) | gemini-4-argon-medium | planted bug, known answer | yes | found a-b vs a+b; read file with no permission denial in headless mode |
