@@ -789,8 +789,11 @@ function nestedEditFor(src, masked, from, policy, sessionTier, cwd) {
     }
   }
   if (exprStart === -1 || exprEnd === -1) return null;
-  const childPath = evalStaticString(src, masked, exprStart, exprEnd);
-  if (!childPath || !childPath.startsWith('/') || resolve(childPath) !== childPath) return null;
+  const written = evalStaticString(src, masked, exprStart, exprEnd);
+  if (!written || !written.startsWith('/')) return null; // relative: base dir unknown
+  // Normalise rather than compare raw text: macOS temp paths carry a `//`, and a
+  // `..` must not be able to step out of the working directory unnoticed.
+  const childPath = resolve(written);
   // Only inside the session's working directory: that is the one place a sibling
   // copy is certain to be loadable. Anywhere else stays as written and is reported.
   const base = cwd ? resolve(cwd) : null;
