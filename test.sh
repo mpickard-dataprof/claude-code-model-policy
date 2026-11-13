@@ -1147,7 +1147,7 @@ echo "== Antigravity grants: tiers, precedence, access and spill =="
 # the immutable record the gate gave the relay, not the now-removed old preamble.
 for pool in gemini agy; do
   case "$pool" in
-    gemini) tag='[gemini]'; h='gemini-3.8-flash-low'; s='gemini-3.8-flash-medium'; o='gemini-4-argon-high'; f='gemini-4-argon-high' ;;
+    gemini) tag='[gemini]'; h='gemini-3.8-flash-low'; s='gemini-4-hydrogen-medium'; o='gemini-4-argon-high'; f='gemini-4-argon-high' ;;
     agy) tag='[agy]'; h='gpt-oss-120b-medium'; s='claude-sonnet-5-5-medium'; o='claude-opus-5-5-high'; f='claude-opus-5-5-high' ;;
   esac
   agy_route "$tag [cheap]" "review this" "$DIR"
@@ -1422,7 +1422,7 @@ grant "$G_BIG" thirdparty claude-sonnet-5-5-medium read-only "$SANDBOX/.worktree
 out="$(AGY_BIG_ANSWER=1 agy_wrap_full --grant "$G_BIG")"
 assert "wrapper emits delimiter then a capped answer" yes "$(json="${out%%$'\n'*}"; state="$(printf '%s' "$json" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).truncated?"yes":"no")}catch{process.stdout.write("no")}})')"; case "$out" in *'--- AGY-ANSWER ---'*'truncated at 200 KiB'*) marker=yes ;; *) marker=no ;; esac; [ "$state" = yes ] && [ "$marker" = yes ] && echo yes || echo no)"
 G2=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-grant "$G2" gemini gemini-3.8-flash-medium edit "$SANDBOX/.worktrees/x" 'bad'
+grant "$G2" gemini gemini-4-hydrogen-medium edit "$SANDBOX/.worktrees/x" 'bad'
 assert "forged Gemini edit grant is refused" grant_invalid "$(agy_wrap --grant "$G2" | "$NODE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).reason)}catch{}})')"
 G3=cccccccccccccccccccccccccccccccccccccccccccccccc
 grant "$G3" thirdparty claude-sonnet-5-5-medium read-only "$DIR" 'review'
