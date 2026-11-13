@@ -154,7 +154,7 @@
         "tag": "[gemini]",
         "byTier": {
           "haiku": "gemini-3.8-flash-low",
-          "sonnet": "gemini-3.8-flash-medium",
+          "sonnet": "gemini-4-hydrogen-medium",
           "opus": "gemini-4-argon-high",
           "fable": "gemini-4-argon-high"
         }
