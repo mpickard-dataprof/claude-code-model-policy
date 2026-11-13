@@ -10,7 +10,7 @@
 import {
   readStdin, parseJson, loadPolicy, resolveTier, sessionRecordFor, normalizeModel,
   sessionTierFromTranscript, writeSessionTier, tierIndex, promptFingerprint,
-  stripCodeNoise, injectWorkflowTiers, resolveWorkflowScript, sessionTierFor,
+  stripCodeNoise, injectWorkflowTiers, refreshNestedChildren, resolveWorkflowScript, sessionTierFor,
   ledger, emit, recordSessionEvent, promptHash, resolveCodexOffload, resolveAgyOffload,
   offloadTag, issueAgyGrant, agyRelayPreamble, agyCwdAllowed, ROOT,
 } from './lib.mjs';
@@ -434,7 +434,17 @@ async function main() {
       // behind an iterate-on-scriptPath loop already carries the shim. Re-injecting
       // would nest it and, worse, change every call's opts — which is exactly what
       // invalidates a resume cache.
-      if (indirect.source.includes('__mpAgent')) { note('already-enforced'); return; }
+      if (indirect.source.includes('__mpAgent')) {
+        // The parent is left alone, but a nested child it points at may have been
+        // edited since its tiered copy was made — regenerate those copies in place.
+        let refreshed = 0;
+        try {
+          refreshed = refreshNestedChildren(indirect.source, policy,
+            sessionTierFor(input.session_id) || sessionTierFromTranscript(input.transcript_path));
+        } catch { /* never fail a workflow over a cache refresh */ }
+        note('already-enforced', refreshed ? { nested_refreshed: refreshed } : {});
+        return;
+      }
 
       // Resuming replays completed agents whose (prompt, opts) are unchanged.
       // Adding a model changes opts, so injecting here would discard the cache and
@@ -468,7 +478,7 @@ async function main() {
     if (policy.workflow?.enforce !== false) {
       const sessionTier = sessionTierFor(input.session_id)
         || sessionTierFromTranscript(input.transcript_path);
-      injected = injectWorkflowTiers(script, policy, sessionTier);
+      injected = injectWorkflowTiers(script, policy, sessionTier, { cwd: input.cwd });
     }
     const enforced = Boolean(injected?.script);
 
@@ -487,6 +497,8 @@ async function main() {
       enforced,
       sites: injected?.sites ?? 0,
       nested: injected?.nested ?? 0,
+      nested_rewritten: injected?.nestedRewritten ?? 0,
+      nested_unresolved: injected?.nestedUnresolved ?? 0,
       reason: injected?.reason ?? 'disabled',
       denied: deny,
     }, policy.limits?.ledgerMaxBytes);
@@ -507,13 +519,18 @@ async function main() {
             `model-policy: tiered ${injected.sites} agent() call site(s)` +
             (indirect ? ` from ${indirect.form}` : '') +
             `; a call's own model was kept, and an effort it omitted was filled from policy.` +
-            // The child of a nested workflow() is out of reach — measured, its
-            // agents inherit the session model. Say so, because the child script
-            // is usually written in the same turn and can still be tiered by hand.
-            (injected.nested
-              ? `\n\nNOTE: this script calls workflow() ${injected.nested} time(s). A nested ` +
-                `workflow's script is NOT rewritten — its agent() calls will inherit this ` +
-                `session's model. Set opts.model and opts.effort explicitly inside the child script.`
+            (injected.nestedRewritten
+              ? ` ${injected.nestedRewritten} nested workflow() child script(s) were tiered the same way ` +
+                `(a .mp-tiered.* copy saved beside each child is run; the original file is untouched).`
+              : '') +
+            // A child whose path is computed at runtime cannot be read here, and —
+            // measured — its agents then inherit the session model. Say so: the
+            // child is usually written in the same turn and can be tiered by hand.
+            (injected.nestedUnresolved
+              ? `\n\nNOTE: ${injected.nestedUnresolved} nested workflow() call(s) could not be resolved ` +
+                `statically. That nested workflow's script is NOT rewritten — its agent() calls will ` +
+                `inherit this session's model. Pass an absolute literal scriptPath, or set opts.model ` +
+                `and opts.effort explicitly inside the child script.`
               : ''),
           updatedInput,
         },

@@ -6,7 +6,7 @@ import {
   readFileSync, writeFileSync, appendFileSync, statSync, accessSync, constants, renameSync,
   mkdirSync, readdirSync, lstatSync, unlinkSync, openSync, readSync, closeSync, realpathSync, chmodSync,
 } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, basename, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash, randomBytes } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -227,7 +227,9 @@ export function resolveTier(toolInput, policy, sessionTier) {
     const shortPrompt = prompt.length <= (c.cheap?.maxChars ?? 0);
 
     if (hitExpensive || longPrompt) {
-      tier = 'opus';
+      // Configurable so a temporary promotion can lift "expensive" work to another
+      // tier from policy.json alone. Defaults to opus.
+      tier = c.expensive?.tier || 'opus';
       rule = hitExpensive ? 'score:expensive-verb' : 'score:long-prompt';
     } else if (hitCheap && shortPrompt) {
       tier = 'haiku';
@@ -623,6 +625,208 @@ export function stripCodeNoise(src) {
   return out;
 }
 
+/** Every agent definition of ours that declares a model: { name: tier }. */
+export function declaredModels() {
+  const out = {};
+  let names = [];
+  try { names = readdirSync(AGENTS_DIR); } catch { return out; }
+  for (const f of names) {
+    if (!f.endsWith('.md')) continue;
+    const name = f.slice(0, -3);
+    const tier = declaredModelFor(name);
+    if (tier) out[name] = tier;
+  }
+  return out;
+}
+
+/**
+ * Statically evaluate a JS expression that is nothing but string pieces:
+ * quoted literals, template literals whose only interpolations are bare
+ * identifiers, identifiers bound by a single `const NAME = <same kind of
+ * expression>`, joined with `+`. Returns the string, or null for anything else.
+ *
+ * Deliberately NOT eval: this runs in a PreToolUse hook on source the model just
+ * wrote. `masked` is stripCodeNoise(src), so a `+` or `;` inside a string cannot
+ * be mistaken for structure.
+ */
+export function evalStaticString(src, masked, start, end, depth = 0) {
+  if (depth > 6) return null;
+  const ident = (name) => {
+    const re = new RegExp(`\\bconst\\s+${name.replace(/\$/g, '\\$')}\\s*=`, 'g');
+    const hits = [];
+    let m;
+    while ((m = re.exec(masked)) !== null) hits.push(m.index + m[0].length);
+    if (hits.length !== 1) return null; // unbound, or shadowed somewhere: do not guess
+    let e = hits[0];
+    let d = 0;
+    for (; e < masked.length; e++) {
+      const ch = masked[e];
+      if (ch === '(' || ch === '[' || ch === '{') d++;
+      else if (ch === ')' || ch === ']' || ch === '}') { if (d === 0) break; d--; }
+      else if (d === 0 && (ch === ';' || ch === '\n' || ch === ',')) break;
+    }
+    return evalStaticString(src, masked, hits[0], e, depth + 1);
+  };
+
+  // Split on top-level `+` using the masked text, then read terms from the original.
+  const terms = [];
+  let from = start;
+  for (let i = start; i <= end; i++) {
+    if (i === end || masked[i] === '+') { terms.push([from, i]); from = i + 1; }
+  }
+  let value = '';
+  for (const [a, b] of terms) {
+    const t = src.slice(a, b).trim();
+    if (!t) return null;
+    const q = t[0];
+    if ((q === '"' || q === "'") && t.length >= 2 && t[t.length - 1] === q) {
+      const inner = t.slice(1, -1);
+      if (inner.includes('\\') || inner.includes(q)) return null;
+      value += inner;
+    } else if (q === '`' && t.length >= 2 && t[t.length - 1] === '`') {
+      const inner = t.slice(1, -1);
+      if (inner.includes('\\') || inner.includes('`')) return null;
+      let failed = false;
+      const filled = inner.replace(/\$\{([^}]*)\}/g, (_, name) => {
+        const n = name.trim();
+        const v = /^[A-Za-z_$][\w$]*$/.test(n) ? ident(n) : null;
+        if (v === null) failed = true;
+        return v ?? '';
+      });
+      if (failed) return null;
+      value += filled;
+    } else if (/^[A-Za-z_$][\w$]*$/.test(t)) {
+      const v = ident(t);
+      if (v === null) return null;
+      value += v;
+    } else {
+      return null;
+    }
+  }
+  return value;
+}
+
+/** Prefix of a tiered copy's file name: `.mp-tiered.<tier>.<original name>`. */
+const TIERED_PREFIX = '.mp-tiered.';
+
+/**
+ * Rewrite one nested-workflow child script and save the copy BESIDE the original.
+ *
+ * Beside it, not in a cache of ours: measured live, the Workflow tool refuses a
+ * scriptPath outside the directories the session can already read ("scriptPath
+ * must be ... a file you can already read"), so a copy under this package's own
+ * directory fails the user's workflow outright. A sibling of a file the session
+ * can load is loadable for the same reason the original is.
+ *
+ * The copy's name is derived from the original's name plus the session tier, not
+ * from its content, so the path written into the parent stays valid while the
+ * child is edited: every later gate pass regenerates the copy in place from the
+ * current original (see refreshNestedChildren). The original is only ever read.
+ *
+ * Returns the copy's path; 'ok' when the child needs no rewrite; null on any doubt.
+ */
+export function rewriteNestedChild(childPath, policy, sessionTier, target = null) {
+  let source;
+  try {
+    if (statSync(childPath).size > WORKFLOW_MAX_BYTES) return null;
+    source = readFileSync(childPath, 'utf8');
+  } catch {
+    return null;
+  }
+  if (source.includes('__mpAgent')) return 'ok'; // already carries the shim
+  const child = injectWorkflowTiers(source, policy, sessionTier, { isChild: true });
+  if (!child.script) return child.reason === 'no-agent-calls' ? 'ok' : null;
+  try {
+    const out = target
+      || join(dirname(childPath), `${TIERED_PREFIX}${sessionTier || 'any'}.${basename(childPath)}`);
+    let current = null;
+    try { current = readFileSync(out, 'utf8'); } catch { /* first write */ }
+    if (current !== child.script) {
+      const tmp = `${out}.${process.pid}.tmp`;
+      writeFileSync(tmp, child.script);
+      renameSync(tmp, out);
+    }
+    return out;
+  } catch {
+    return null; // unwritable directory: leave the parent's reference untouched
+  }
+}
+
+/**
+ * For the `workflow(` call whose `(` follows `from`, return the edit that
+ * repoints it at a rewritten child: { at, len, replacement }. 'ok' when nothing
+ * needs to change, null when the reference cannot be resolved statically.
+ */
+function nestedEditFor(src, masked, from, policy, sessionTier, cwd) {
+  let i = masked.indexOf('(', from);
+  if (i === -1) return null;
+  i++;
+  while (i < masked.length && /\s/.test(masked[i])) i++;
+  const ch = masked[i];
+
+  // workflow('saved-name', args) is NOT rewritten: a saved workflow lives in a
+  // config directory, and repointing it at a scriptPath there is refused by the
+  // Workflow tool unless the session happens to be able to read that directory.
+  // workflow({ scriptPath: <static string expression> }, args)
+  if (ch !== '{') return null;
+  let depth = 0;
+  let key = -1;
+  let exprStart = -1;
+  let exprEnd = -1;
+  for (let j = i; j < masked.length; j++) {
+    const c = masked[j];
+    if (c === '{' || c === '(' || c === '[') depth++;
+    else if (c === '}' || c === ')' || c === ']') {
+      depth--;
+      if (depth === 0) { if (exprStart !== -1 && exprEnd === -1) exprEnd = j; break; }
+    } else if (depth === 1 && c === ',' && exprStart !== -1 && exprEnd === -1) {
+      exprEnd = j;
+    } else if (depth === 1 && key === -1 && /^scriptPath\s*:/.test(masked.slice(j, j + 40))
+      && !/[\w$.]/.test(masked[j - 1])) {
+      key = j;
+      exprStart = masked.indexOf(':', j) + 1;
+      j = exprStart - 1;
+    }
+  }
+  if (exprStart === -1 || exprEnd === -1) return null;
+  const written = evalStaticString(src, masked, exprStart, exprEnd);
+  if (!written || !written.startsWith('/')) return null; // relative: base dir unknown
+  // Normalise rather than compare raw text: macOS temp paths carry a `//`, and a
+  // `..` must not be able to step out of the working directory unnoticed.
+  const childPath = resolve(written);
+  // Only inside the session's working directory: that is the one place a sibling
+  // copy is certain to be loadable. Anywhere else stays as written and is reported.
+  const base = cwd ? resolve(cwd) : null;
+  if (!base || !childPath.startsWith(base.endsWith('/') ? base : base + '/')) return null;
+  const copy = rewriteNestedChild(childPath, policy, sessionTier);
+  if (copy === 'ok' || copy === null) return copy;
+  return { at: exprStart, len: exprEnd - exprStart, replacement: ` ${JSON.stringify(copy)} ` };
+}
+
+/**
+ * Regenerate every cached child a script points at, from the child's current
+ * original. Called for a parent that already carries the shim (an iterate-on-
+ * scriptPath loop or a resume): the parent is not touched, but its child may
+ * have been edited since, and a stale copy would silently run the old child.
+ * Returns how many copies were refreshed.
+ */
+export function refreshNestedChildren(parentSrc, policy, sessionTier) {
+  let n = 0;
+  const seen = new Set();
+  const re = /\/[^"'`\s]*\/\.mp-tiered\.[a-z]+\.[^"'`\s/]+/g;
+  let m;
+  while ((m = re.exec(String(parentSrc || ''))) !== null) {
+    const copy = m[0];
+    if (seen.has(copy)) continue;
+    seen.add(copy);
+    const original = join(dirname(copy), basename(copy).replace(/^\.mp-tiered\.[a-z]+\./, ''));
+    try {
+      if (rewriteNestedChild(original, policy, sessionTier, copy) === copy) n++;
+    } catch { /* leave the copy as it is */ }
+  }
+  return n;
+}
+
 /**
  * Enforce tiers on the Workflow path by rewriting the script.
  *
@@ -649,7 +853,7 @@ export function stripCodeNoise(src) {
  * provably safe, and the caller must then pass the original through untouched —
  * breaking a valid workflow is far worse than failing to optimise one.
  */
-export function injectWorkflowTiers(src, policy, sessionTier) {
+export function injectWorkflowTiers(src, policy, sessionTier, opts = {}) {
   if (typeof src !== 'string' || !src) return { script: null, sites: 0, reason: 'empty' };
 
   const masked = stripCodeNoise(src);
@@ -687,20 +891,36 @@ export function injectWorkflowTiers(src, policy, sessionTier) {
   };
   const agentSites = collect('agent', '__mpAgent');
 
-  // A nested workflow() runs a child script the gate never sees, and the child's
-  // agent() calls cannot be reached from here. Wrapping workflow() to patch
-  // globalThis.agent for the child's duration was TRIED AND MEASURED: the property
-  // is writable, but the child resolves its own binding, so the child's agent ran
-  // on opus while the parent's identical prompt ran on haiku. Only counted now, so
-  // the ledger shows when this construct is actually in use.
+  // A nested workflow() runs a child script the gate never sees. Patching
+  // globalThis.agent for the child's duration was TRIED AND MEASURED not to reach
+  // it (the child resolves its own binding: child ran opus, parent haiku on the
+  // same prompt). What does work is doing the rewrite HERE: resolve the child's
+  // path statically, rewrite the child the same way, save that copy beside
+  // the original and repoint the parent's reference at it. A reference that
+  // cannot be resolved statically is left exactly as written and only counted.
   const nestedSites = collect('workflow', null);
-  if (!agentSites.length) {
-    return { script: null, sites: 0, nested: nestedSites.length, reason: 'no-agent-calls' };
+  const nestedEdits = [];
+  let nestedUnresolved = 0;
+  if (!opts.isChild) {
+    for (const s of nestedSites) {
+      const edit = nestedEditFor(src, masked, s.at + s.len, policy, sessionTier, opts.cwd);
+      if (edit === 'ok') continue;          // child needs no rewrite (already tiered / no agents)
+      if (edit) nestedEdits.push(edit);
+      else nestedUnresolved++;
+    }
   }
+  if (!agentSites.length && !nestedEdits.length) {
+    return {
+      script: null, sites: 0, nested: nestedSites.length,
+      nestedRewritten: 0, nestedUnresolved, reason: 'no-agent-calls',
+    };
+  }
+
+  const edits = [...agentSites, ...nestedEdits].sort((a, b) => a.at - b.at);
 
   let out = '';
   let cursor = 0;
-  for (const s of agentSites) {
+  for (const s of edits) {
     out += src.slice(cursor, s.at) + s.replacement;
     cursor = s.at + s.len; // the trailing `\s*(` is preserved as written
   }
@@ -712,9 +932,14 @@ export function injectWorkflowTiers(src, policy, sessionTier) {
     order: policy.tierOrder || DEFAULT_TIER_ORDER,
     ceiling: sessionTier || null,
     cheap: { maxChars: c.cheap?.maxChars ?? 0, patterns: c.cheap?.patterns || [] },
-    expensive: { minChars: c.expensive?.minChars ?? Infinity, patterns: c.expensive?.patterns || [] },
+    expensive: { minChars: c.expensive?.minChars ?? Infinity, patterns: c.expensive?.patterns || [], tier: c.expensive?.tier || 'opus' },
     effort: policy.workflow?.effortByTier || { haiku: 'low', sonnet: 'medium', opus: 'high', fable: 'high' },
     disabled: Array.isArray(policy.disabledTiers) ? policy.disabledTiers : [],
+    // agentType -> the model its own definition declares. A scored tier must not
+    // exceed it, exactly as on the Agent path (Layer 3a-bis). Measured: 287 `codex`
+    // relay agents inside workflows ran on opus/sonnet because the REVIEW prompt
+    // they merely pass along scored expensive; the relay itself declares haiku.
+    declared: declaredModels(),
   };
 
   const shim = `
@@ -731,7 +956,7 @@ const __mpMin = (a, b) => {
 function __mpPick(prompt) {
   const p = String(prompt == null ? '' : prompt);
   let tier;
-  if (__mpExp.some((r) => r.test(p)) || p.length >= __mpCfg.expensive.minChars) tier = 'opus';
+  if (__mpExp.some((r) => r.test(p)) || p.length >= __mpCfg.expensive.minChars) tier = __mpCfg.expensive.tier;
   else if (__mpChp.some((r) => r.test(p)) && p.length <= __mpCfg.cheap.maxChars) tier = 'haiku';
   else tier = __mpCfg.base;
   if (__mpCfg.ceiling) tier = __mpMin(tier, __mpCfg.ceiling);
@@ -762,7 +987,14 @@ function __mpTier(m) {
 const __mpReal = agent;
 function __mpAgent(prompt, opts) {
   const o = Object.assign({}, opts || {});
-  if (!o.model) o.model = __mpPick(prompt);
+  if (!o.model) {
+    o.model = __mpPick(prompt);
+    /* Never score above the model the agent definition declares for itself. An
+       explicit opts.model is the author's decision and is left alone. */
+    if (typeof o.agentType === 'string' && Object.prototype.hasOwnProperty.call(__mpCfg.declared, o.agentType)) {
+      o.model = __mpMin(o.model, __mpCfg.declared[o.agentType]);
+    }
+  }
   /* Effort is filled whenever it is ABSENT, including on a call that chose its
      own model. The scorer only ever returns haiku/sonnet/opus, so the previous
      "only when we picked the model" rule made effortByTier.fable unreachable:
@@ -796,6 +1028,8 @@ function __mpAgent(prompt, opts) {
     script: rewritten,
     sites: agentSites.length,
     nested: nestedSites.length,
+    nestedRewritten: nestedEdits.length,
+    nestedUnresolved,
     reason: 'ok',
   };
 }

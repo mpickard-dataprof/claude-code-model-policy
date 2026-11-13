@@ -22,3 +22,6 @@ __pycache__/
 
 # Mountain Duck sync metadata
 .duckversions/
+
+# Tiered copies of nested-workflow child scripts
+.mp-tiered.*

@@ -288,6 +288,73 @@ case "$NESTED" in
   *) printf '  \033[31mFAIL\033[0m  %-46s -> NOT TIERED\n' "the parent's own agent() is still tiered"; FAIL=$((FAIL+1));;
 esac
 
+# Nested workflow() children ARE rewritten when their path resolves statically,
+# and relay agent types are capped at the model their definition declares.
+mkdir -p "$SANDBOX/nest/build"
+printf '%s\n' "export const meta = { name: 'child', description: 'c' }" "const r = await agent('debug the failing thing ' + args.k)" "return r" > "$SANDBOX/nest/build/child.js"
+cat > "$SANDBOX/nest/t.mjs" <<'EOF_NESTED'
+import fs from 'node:fs';
+import path from 'node:path';
+const S=process.argv[2];
+const m=await import(process.argv[3]+'/hooks/lib.mjs');
+const p=JSON.parse(fs.readFileSync(process.argv[3]+'/policy.json'));
+const ok=(n,c)=>console.log((c?'PASS':'FAIL')+'\t'+n);
+const parent=`export const meta = { name: 'p', description: 'd' }
+const ROOT = '${S}'
+const WF = ROOT + '/build'
+// workflow({ scriptPath: 'in a comment' })
+const a = await agent('list files', { agentType: 'codex' })
+const rev = await workflow({ scriptPath: WF + '/child.js' }, { k: 1 })
+const t = await workflow({ scriptPath: \`\${WF}/child.js\` })
+const dyn = await workflow({ scriptPath: args.path })
+return rev`;
+const r=m.injectWorkflowTiers(parent,p,'opus',{cwd:S});
+const far=m.injectWorkflowTiers(parent,p,'opus',{cwd:S+'/elsewhere'});
+ok('child outside the working directory is left alone',far.nestedRewritten===0&&far.nestedUnresolved===3);
+const nm=m.injectWorkflowTiers(parent.replace("{ scriptPath: WF + '/child.js' }","'saved-name'"),p,'opus',{cwd:S});
+ok('saved-name form is left alone',nm.script.includes("workflow('saved-name'"));
+ok('parent rewritten',r.reason==='ok'&&r.sites===1);
+ok('nested counts',r.nested===3&&r.nestedRewritten===2&&r.nestedUnresolved===1);
+const lit=r.script.match(/scriptPath:\s+"([^"]+)"/);
+ok('repointed to a sibling copy',lit&&lit[1]===path.resolve(S+'/build/.mp-tiered.opus.child.js'));
+ok('dynamic left alone',r.script.includes('scriptPath: args.path'));
+ok('comment untouched',r.script.includes("// workflow({ scriptPath: 'in a comment' })"));
+const child=fs.readFileSync(lit[1],'utf8');
+ok('child shimmed',child.includes('__mpAgent(')&&child.startsWith('export const meta'));
+ok('original child untouched',!fs.readFileSync(S+'/build/child.js','utf8').includes('__mpAgent'));
+ok('whole thing parses',(()=>{try{new Function('return (async()=>{'+r.script.replace(/\bexport\s+const\b/g,'const')+'\n})');return true}catch(e){console.log(e.message);return false}})());
+// refresh after edit
+fs.appendFileSync(S+'/build/child.js','\n// edited-marker\n');
+ok('refresh count',m.refreshNestedChildren(r.script,p,'opus')===1);
+ok('refresh picked up edit',fs.readFileSync(lit[1],'utf8').includes('edited-marker'));
+// only-nested parent (no agent calls of its own)
+const r2=m.injectWorkflowTiers(`export const meta = { name: 'p', description: 'd' }\nreturn await workflow({ scriptPath: '${S}/build/child.js' })`,p,'opus',{cwd:S});
+ok('parent with only a nested call is rewritten',r2.reason==='ok'&&r2.nestedRewritten===1);
+// run the shim for real with a fake agent(): relay clamp + explicit model kept
+const run=async(src,tier)=>{const calls=[];const body=m.injectWorkflowTiers(src,p,tier).script.replace(/\bexport\s+const\b/g,'const');
+  await new Function('agent','args','return (async()=>{'+body+'\n})()')((pr,o)=>{calls.push(o);return 'x'},{});return calls;};
+const c=await run(`export const meta = { name: 'p', description: 'd' }
+await agent('debug the failing build and find the root cause', { agentType: 'codex' })
+await agent('debug the failing build', { agentType: 'codex', model: 'opus' })
+await agent('debug the failing build', { agentType: 'worker' })
+await agent('debug the failing build')
+await agent('debug the failing build', { agentType: 'constructor' })`,'fable');
+ok('codex relay clamped to haiku',c[0].model==='haiku'&&c[0].effort==='low');
+ok('explicit model kept',c[1].model==='opus');
+ok('worker clamped to sonnet',c[2].model==='sonnet');
+const X=p.catchAll?.expensive?.tier||'opus';
+ok('plain call gets the expensive tier',c[3].model===X);
+ok('odd agentType safe',c[4].model===X);
+EOF_NESTED
+while IFS="$(printf '\t')" read -r verdict name; do
+  case "$verdict" in
+    PASS) printf '  \033[32mPASS\033[0m  %-46s\n' "$name"; PASS=$((PASS+1));;
+    *)    printf '  \033[31mFAIL\033[0m  %-46s\n' "${name:-nested/relay suite did not run}"; FAIL=$((FAIL+1));;
+  esac
+done <<EOF_RESULTS
+$("$NODE" "$SANDBOX/nest/t.mjs" "$SANDBOX/nest" "$DIR" 2>&1 || printf 'FAIL\tnested/relay suite crashed\n')
+EOF_RESULTS
+
 echo
 echo "== Fail-open =="
 check "unrelated tool ignored"         NOOP '{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"}}'
